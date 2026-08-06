@@ -12,6 +12,7 @@
 #include <functional>
 #include <atomic>
 #include <string>
+#include <thread>
 
 namespace net {
 
@@ -48,6 +49,7 @@ private:
     asio::ip::tcp::acceptor acceptor_;
     int heartbeat_timeout_s_;
     std::atomic<bool> is_running_;
+    std::thread acceptor_thread_;
 
     OnConnectHandler on_connect_;
     OnMessageHandler on_message_;

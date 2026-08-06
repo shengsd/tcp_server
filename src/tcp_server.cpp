@@ -38,12 +38,14 @@ void TcpServer::Start() {
     io_thread_pool_.Start();
     DoAccept();
 
-    // 运行主事件循环 (负责接收连接)
-    try {
-        main_io_context_.run();
-    } catch (const std::exception& e) {
-        std::cerr << "[TcpServer] Main io_context exception: " << e.what() << std::endl;
-    }
+    // 在独立子线程运行 Accept 事件循环，使 Start() 成为非阻塞调用
+    acceptor_thread_ = std::thread([this]() {
+        try {
+            main_io_context_.run();
+        } catch (const std::exception& e) {
+            std::cerr << "[TcpServer] Main io_context exception: " << e.what() << std::endl;
+        }
+    });
 }
 
 void TcpServer::Stop() {
@@ -54,6 +56,10 @@ void TcpServer::Stop() {
     acceptor_.close(ec);
     main_io_context_.stop();
     io_thread_pool_.Stop();
+
+    if (acceptor_thread_.joinable()) {
+        acceptor_thread_.join();
+    }
 }
 
 void TcpServer::DoAccept() {

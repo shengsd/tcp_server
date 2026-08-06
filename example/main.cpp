@@ -1,16 +1,16 @@
 #include "net/tcp_server.h"
 #include <iostream>
 #include <csignal>
-#include <atomic>
+#include <future>
 
-static net::TcpServer* g_server = nullptr;
+static std::promise<void> g_exit_promise;
 
 void SignalHandler(int signal) {
     if (signal == SIGINT || signal == SIGTERM) {
         std::cout << "\n[Main] Signal received, stopping server..." << std::endl;
-        if (g_server) {
-            g_server->Stop();
-        }
+        try {
+            g_exit_promise.set_value();
+        } catch (...) {}
     }
 }
 
@@ -25,7 +25,6 @@ int main() {
     std::cout << "Heartbeat timeout set to " << heartbeat_timeout_s << " seconds." << std::endl;
 
     net::TcpServer server(port, 4 /* 4个IO线程 */, heartbeat_timeout_s);
-    g_server = &server;
 
     // 1. 新连接建立回调
     server.SetOnConnect([](net::TcpSessionPtr session) {
@@ -60,9 +59,15 @@ int main() {
                   << "): " << ec.message() << std::endl;
     });
 
-    // 启动 TCP 服务器
+    // 启动 TCP 服务器 (非阻塞调用，函数立即返回)
     server.Start();
+    std::cout << "[Main] server.Start() called successfully, non-blocking return." << std::endl;
 
+    // 主线程等待退出信号
+    g_exit_promise.get_future().wait();
+
+    // 优雅停止服务器
+    server.Stop();
     std::cout << "[Main] Server stopped gracefully." << std::endl;
     return 0;
 }
