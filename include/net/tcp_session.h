@@ -43,6 +43,10 @@ public:
     void SetOnClose(OnCloseHandler cb) { on_close_ = std::move(cb); }
     void SetOnError(OnErrorHandler cb) { on_error_ = std::move(cb); }
     void SetHeartbeatTimeout(int seconds) { heartbeat_timeout_s_ = seconds; }
+    void SetMaxSendQueueSize(std::size_t max_size) { max_send_queue_size_ = max_size; }
+    
+    // 供 TcpServer 内部使用，用于清理 active_sessions_
+    void SetInternalCloseHandler(std::function<void(TcpSessionPtr)> cb) { internal_close_handler_ = std::move(cb); }
 
 private:
     void DoRead();
@@ -60,10 +64,13 @@ private:
 
     std::array<uint8_t, 8192> read_buffer_;
     std::deque<std::vector<uint8_t>> write_queue_;
+    std::size_t max_send_queue_size_{10 * 1024 * 1024}; // 默认10MB
+    std::atomic<std::size_t> current_send_queue_size_{0};
 
     OnMessageHandler on_message_;
     OnCloseHandler on_close_;
     OnErrorHandler on_error_;
+    std::function<void(TcpSessionPtr)> internal_close_handler_;
 };
 
 } // namespace net

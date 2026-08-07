@@ -52,13 +52,28 @@ void TcpServer::Stop() {
     if (!is_running_) return;
     is_running_ = false;
 
+    // 先主动关闭所有活跃会话，防止析构期内存泄露或回调崩溃
+    std::vector<TcpSessionPtr> sessions_to_close;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        sessions_to_close.assign(active_sessions_.begin(), active_sessions_.end());
+        active_sessions_.clear();
+    }
+    for (auto& session : sessions_to_close) {
+        session->Close();
+    }
+
     std::error_code ec;
     acceptor_.close(ec);
     main_io_context_.stop();
     io_thread_pool_.Stop();
 
     if (acceptor_thread_.joinable()) {
-        acceptor_thread_.join();
+        if (acceptor_thread_.get_id() == std::this_thread::get_id()) {
+            acceptor_thread_.detach();
+        } else {
+            acceptor_thread_.join();
+        }
     }
 }
 
@@ -71,13 +86,35 @@ void TcpServer::DoAccept() {
 
         if (!ec) {
             auto session = std::make_shared<TcpSession>(std::move(*socket_ptr), heartbeat_timeout_s_);
+            session->SetMaxSendQueueSize(max_send_queue_size_);
 
             if (on_message_) session->SetOnMessage(on_message_);
             if (on_close_) session->SetOnClose(on_close_);
             if (on_error_) session->SetOnError(on_error_);
 
+            // 设置内部清理回调
+            session->SetInternalCloseHandler([this](TcpSessionPtr s) {
+                std::lock_guard<std::mutex> lock(sessions_mutex_);
+                active_sessions_.erase(s);
+            });
+
+            {
+                std::lock_guard<std::mutex> lock(sessions_mutex_);
+                active_sessions_.insert(session);
+            }
+
             if (on_connect_) {
-                on_connect_(session);
+                try {
+                    on_connect_(session);
+                } catch (const std::exception& e) {
+                    std::cerr << "[TcpServer] on_connect exception: " << e.what() << std::endl;
+                    session->Close();
+                    return;
+                } catch (...) {
+                    std::cerr << "[TcpServer] on_connect unknown exception" << std::endl;
+                    session->Close();
+                    return;
+                }
             }
 
             session->Start();

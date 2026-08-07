@@ -1,23 +1,16 @@
 #include "net/tcp_server.h"
 #include <iostream>
-#include <csignal>
 #include <future>
+#include <thread>
+#include <asio.hpp>
 
 static std::promise<void> g_exit_promise;
 
-void SignalHandler(int signal) {
-    if (signal == SIGINT || signal == SIGTERM) {
-        std::cout << "\n[Main] Signal received, stopping server..." << std::endl;
-        try {
-            g_exit_promise.set_value();
-        } catch (...) {}
-    }
-}
-
 int main() {
-    std::signal(SIGINT, SignalHandler);
-    std::signal(SIGTERM, SignalHandler);
-
+    // 启动一个专用的 IO context 处理信号，保证 async-signal-safety
+    asio::io_context signal_ctx;
+    asio::signal_set signals(signal_ctx, SIGINT, SIGTERM);
+    
     unsigned short port = 8888;
     int heartbeat_timeout_s = 15; // 15秒无数据包自动切断空闲连接
 
@@ -25,6 +18,17 @@ int main() {
     std::cout << "Heartbeat timeout set to " << heartbeat_timeout_s << " seconds." << std::endl;
 
     net::TcpServer server(port, 4 /* 4个IO线程 */, heartbeat_timeout_s);
+
+    signals.async_wait([&](const std::error_code&, int signal_number) {
+        std::cout << "\n[Main] Signal " << signal_number << " received, stopping server..." << std::endl;
+        try {
+            g_exit_promise.set_value();
+        } catch (...) {}
+    });
+    
+    std::thread sig_thread([&]() {
+        signal_ctx.run();
+    });
 
     // 1. 新连接建立回调
     server.SetOnConnect([](net::TcpSessionPtr session) {
@@ -69,5 +73,11 @@ int main() {
     // 优雅停止服务器
     server.Stop();
     std::cout << "[Main] Server stopped gracefully." << std::endl;
+
+    signal_ctx.stop();
+    if (sig_thread.joinable()) {
+        sig_thread.join();
+    }
+
     return 0;
 }

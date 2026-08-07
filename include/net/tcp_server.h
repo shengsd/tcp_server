@@ -13,6 +13,8 @@
 #include <atomic>
 #include <string>
 #include <thread>
+#include <unordered_set>
+#include <mutex>
 
 namespace net {
 
@@ -39,6 +41,7 @@ public:
     void SetOnMessage(OnMessageHandler cb) { on_message_ = std::move(cb); }
     void SetOnClose(OnCloseHandler cb) { on_close_ = std::move(cb); }
     void SetOnError(OnErrorHandler cb) { on_error_ = std::move(cb); }
+    void SetMaxSendQueueSize(std::size_t max_size) { max_send_queue_size_ = max_size; }
 
 private:
     void DoAccept();
@@ -50,6 +53,10 @@ private:
     int heartbeat_timeout_s_;
     std::atomic<bool> is_running_;
     std::thread acceptor_thread_;
+    std::size_t max_send_queue_size_{10 * 1024 * 1024};
+    
+    std::mutex sessions_mutex_;
+    std::unordered_set<TcpSessionPtr> active_sessions_;
 
     OnConnectHandler on_connect_;
     OnMessageHandler on_message_;

@@ -47,7 +47,11 @@ void IOThreadPool::Stop() {
 
     for (auto& t : threads_) {
         if (t.joinable()) {
-            t.join();
+            if (t.get_id() == std::this_thread::get_id()) {
+                t.detach();
+            } else {
+                t.join();
+            }
         }
     }
     threads_.clear();

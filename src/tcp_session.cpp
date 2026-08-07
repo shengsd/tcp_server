@@ -17,7 +17,12 @@ TcpSession::TcpSession(asio::ip::tcp::socket socket, int heartbeat_timeout_s)
 }
 
 TcpSession::~TcpSession() {
-    Close();
+    std::error_code ec;
+    heartbeat_timer_.cancel(ec);
+    if (socket_.is_open()) {
+        socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+        socket_.close(ec);
+    }
 }
 
 void TcpSession::Start() {
@@ -27,6 +32,14 @@ void TcpSession::Start() {
 
 void TcpSession::Send(const uint8_t* data, std::size_t length) {
     if (is_closed_ || !data || length == 0) return;
+
+    if (current_send_queue_size_.load(std::memory_order_relaxed) + length > max_send_queue_size_) {
+        std::cerr << "[TcpSession] Send queue high watermark exceeded, closing connection." << std::endl;
+        Close();
+        return;
+    }
+    
+    current_send_queue_size_.fetch_add(length, std::memory_order_relaxed);
 
     auto self(shared_from_this());
     std::vector<uint8_t> buffer(data, data + length);
@@ -68,7 +81,19 @@ void TcpSession::Close() {
     }
 
     if (on_close_) {
-        on_close_(shared_from_this());
+        try {
+            on_close_(shared_from_this());
+        } catch (const std::exception& e) {
+            std::cerr << "[TcpSession] on_close exception: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "[TcpSession] on_close unknown exception" << std::endl;
+        }
+    }
+
+    if (internal_close_handler_) {
+        try {
+            internal_close_handler_(shared_from_this());
+        } catch (...) {}
     }
 }
 
@@ -83,7 +108,17 @@ void TcpSession::DoRead() {
             if (!ec) {
                 ResetHeartbeatTimer();
                 if (on_message_) {
-                    on_message_(self, read_buffer_.data(), bytes_transferred);
+                    try {
+                        on_message_(self, read_buffer_.data(), bytes_transferred);
+                    } catch (const std::exception& e) {
+                        std::cerr << "[TcpSession] on_message exception: " << e.what() << std::endl;
+                        HandleError(asio::error::make_error_code(asio::error::operation_aborted));
+                        return;
+                    } catch (...) {
+                        std::cerr << "[TcpSession] on_message unknown exception" << std::endl;
+                        HandleError(asio::error::make_error_code(asio::error::operation_aborted));
+                        return;
+                    }
                 }
                 DoRead();
             } else {
@@ -99,6 +134,7 @@ void TcpSession::DoWrite() {
             if (is_closed_) return;
 
             if (!ec) {
+                current_send_queue_size_.fetch_sub(write_queue_.front().size(), std::memory_order_relaxed);
                 write_queue_.pop_front();
                 if (!write_queue_.empty()) {
                     DoWrite();
@@ -129,7 +165,13 @@ void TcpSession::HandleError(const std::error_code& ec) {
     }
 
     if (on_error_) {
-        on_error_(shared_from_this(), ec);
+        try {
+            on_error_(shared_from_this(), ec);
+        } catch (const std::exception& e) {
+            std::cerr << "[TcpSession] on_error exception: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "[TcpSession] on_error unknown exception" << std::endl;
+        }
     }
     Close();
 }
