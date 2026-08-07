@@ -69,25 +69,26 @@ void TcpServer::Stop() {
         sessions_to_close.assign(active_sessions_.begin(), active_sessions_.end());
         // 交由内部回调进行 erase，不直接 clear()
     }
-    
+
     if (!sessions_to_close.empty()) {
         auto count = std::make_shared<std::atomic<size_t>>(sessions_to_close.size());
         auto promise = std::make_shared<std::promise<void>>();
         auto future = promise->get_future();
 
         for (auto& session : sessions_to_close) {
-            auto ex = session->GetSocket().get_executor();
-            session->Close(); // Close 内部已实现非阻塞投递
-
-            // 紧跟着投递计数检查，依靠同一队列的 FIFO 保证其在 Close 之后执行
-            asio::post(ex, [count, promise]() {
+            // 完成通知由 session 的真实关闭任务末尾触发，不依赖跨线程投递顺序。
+            session->Close([count, promise]() {
                 if (count->fetch_sub(1, std::memory_order_relaxed) == 1) {
                     promise->set_value();
                 }
             });
         }
-        // 给所有 IO 线程最多 3 秒钟的优雅排空时间，确保用户回调体面结束
-        future.wait_for(std::chrono::seconds(3));
+        // 这是关闭任务的排空宽限期，不是 Stop() 的硬超时：已经开始执行的
+        // 用户回调无法被安全抢占，后续 join 仍会等待它们自行返回。
+        if (future.wait_for(std::chrono::seconds(3)) == std::future_status::timeout) {
+            std::cerr << "[TcpServer] Timed out while draining session close callbacks; forcing IO contexts to stop."
+                      << std::endl;
+        }
     }
 
     std::error_code ec;

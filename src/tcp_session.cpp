@@ -7,7 +7,8 @@ TcpSession::TcpSession(asio::ip::tcp::socket socket, int heartbeat_timeout_s)
     : socket_(std::move(socket)),
       heartbeat_timer_(socket_.get_executor()),
       heartbeat_timeout_s_(heartbeat_timeout_s),
-      is_closed_(false) {
+      is_closed_(false),
+      close_completed_(false) {
     std::error_code ec;
     auto ep = socket_.remote_endpoint(ec);
     if (!ec) {
@@ -67,35 +68,51 @@ void TcpSession::Send(const std::string& message) {
 }
 
 void TcpSession::Close() {
-    bool expected = false;
-    if (!is_closed_.compare_exchange_strong(expected, true)) {
-        return; // 已经关闭
-    }
+    Close(std::function<void()>());
+}
+
+void TcpSession::Close(std::function<void()> completion) {
+    // 立即拒绝新的读写请求；实际 socket/timer 操作统一在所属 executor 中串行执行。
+    is_closed_.store(true, std::memory_order_release);
 
     auto self(shared_from_this());
-    asio::post(socket_.get_executor(), [this, self]() {
-        std::error_code ec;
-        heartbeat_timer_.cancel(ec);
+    asio::post(socket_.get_executor(), [this, self, completion]() {
+        if (!close_completed_) {
+            close_completed_ = true;
 
-        if (socket_.is_open()) {
-            socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
-            socket_.close(ec);
-        }
+            std::error_code ec;
+            heartbeat_timer_.cancel(ec);
 
-        if (on_close_) {
-            try {
-                on_close_(self);
-            } catch (const std::exception& e) {
-                std::cerr << "[TcpSession] on_close exception: " << e.what() << std::endl;
-            } catch (...) {
-                std::cerr << "[TcpSession] on_close unknown exception" << std::endl;
+            if (socket_.is_open()) {
+                socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+                socket_.close(ec);
+            }
+
+            if (on_close_) {
+                try {
+                    on_close_(self);
+                } catch (const std::exception& e) {
+                    std::cerr << "[TcpSession] on_close exception: " << e.what() << std::endl;
+                } catch (...) {
+                    std::cerr << "[TcpSession] on_close unknown exception" << std::endl;
+                }
+            }
+
+            if (internal_close_handler_) {
+                try {
+                    internal_close_handler_(self);
+                } catch (...) {}
             }
         }
 
-        if (internal_close_handler_) {
+        if (completion) {
             try {
-                internal_close_handler_(self);
-            } catch (...) {}
+                completion();
+            } catch (const std::exception& e) {
+                std::cerr << "[TcpSession] close completion exception: " << e.what() << std::endl;
+            } catch (...) {
+                std::cerr << "[TcpSession] close completion unknown exception" << std::endl;
+            }
         }
     });
 }

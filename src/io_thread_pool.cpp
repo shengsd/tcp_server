@@ -35,6 +35,10 @@ void IOThreadPool::Start() {
 }
 
 void IOThreadPool::Stop() {
+    if (IsCurrentThread()) {
+        throw std::logic_error("IOThreadPool::Stop() cannot be called from within its own thread.");
+    }
+
     if (!running_) return;
     running_ = false;
 
@@ -42,7 +46,7 @@ void IOThreadPool::Stop() {
     for (auto& guard : work_guards_) {
         guard.reset();
     }
-    
+
     // 强制终止剩余阻塞中的上下文，打破由异常连接造成的长期等待死锁
     for (auto& io_ctx : io_contexts_) {
         io_ctx->stop();
