@@ -50,6 +50,10 @@ void TcpServer::Start() {
 }
 
 void TcpServer::Stop() {
+    if (acceptor_thread_.joinable() && acceptor_thread_.get_id() == std::this_thread::get_id()) {
+        throw std::logic_error("TcpServer::Stop() cannot be called from the acceptor thread.");
+    }
+
     if (!is_running_) return;
     is_running_ = false;
 
@@ -58,7 +62,7 @@ void TcpServer::Stop() {
     {
         std::lock_guard<std::mutex> lock(sessions_mutex_);
         sessions_to_close.assign(active_sessions_.begin(), active_sessions_.end());
-        active_sessions_.clear();
+        // 交由内部回调进行 erase，不直接 clear()
     }
     for (auto& session : sessions_to_close) {
         session->Close();
@@ -70,11 +74,7 @@ void TcpServer::Stop() {
     io_thread_pool_.Stop();
 
     if (acceptor_thread_.joinable()) {
-        if (acceptor_thread_.get_id() == std::this_thread::get_id()) {
-            throw std::logic_error("TcpServer::Stop() cannot be called from the acceptor thread.");
-        } else {
-            acceptor_thread_.join();
-        }
+        acceptor_thread_.join();
     }
 }
 
@@ -120,7 +120,9 @@ void TcpServer::DoAccept() {
                 }
             }
 
-            session->Start();
+            if (!session->IsClosed()) {
+                session->Start();
+            }
         } else if (ec != asio::error::operation_aborted) {
             std::cerr << "[TcpServer] Accept error: " << ec.message() << std::endl;
         }

@@ -36,6 +36,7 @@ public:
     void Close();
 
     asio::ip::tcp::socket& GetSocket() { return socket_; }
+    bool IsClosed() const { return is_closed_.load(); }
     std::string GetRemoteAddress() const { return remote_address_; }
     unsigned short GetRemotePort() const { return remote_port_; }
 

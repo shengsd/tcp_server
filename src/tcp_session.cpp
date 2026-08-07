@@ -72,29 +72,32 @@ void TcpSession::Close() {
         return; // 已经关闭
     }
 
-    std::error_code ec;
-    heartbeat_timer_.cancel(ec);
+    auto self(shared_from_this());
+    asio::post(socket_.get_executor(), [this, self]() {
+        std::error_code ec;
+        heartbeat_timer_.cancel(ec);
 
-    if (socket_.is_open()) {
-        socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
-        socket_.close(ec);
-    }
-
-    if (on_close_) {
-        try {
-            on_close_(shared_from_this());
-        } catch (const std::exception& e) {
-            std::cerr << "[TcpSession] on_close exception: " << e.what() << std::endl;
-        } catch (...) {
-            std::cerr << "[TcpSession] on_close unknown exception" << std::endl;
+        if (socket_.is_open()) {
+            socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+            socket_.close(ec);
         }
-    }
 
-    if (internal_close_handler_) {
-        try {
-            internal_close_handler_(shared_from_this());
-        } catch (...) {}
-    }
+        if (on_close_) {
+            try {
+                on_close_(self);
+            } catch (const std::exception& e) {
+                std::cerr << "[TcpSession] on_close exception: " << e.what() << std::endl;
+            } catch (...) {
+                std::cerr << "[TcpSession] on_close unknown exception" << std::endl;
+            }
+        }
+
+        if (internal_close_handler_) {
+            try {
+                internal_close_handler_(self);
+            } catch (...) {}
+        }
+    });
 }
 
 

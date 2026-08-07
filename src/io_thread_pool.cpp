@@ -35,24 +35,23 @@ void IOThreadPool::Start() {
 }
 
 void IOThreadPool::Stop() {
+    for (auto& t : threads_) {
+        if (t.joinable() && t.get_id() == std::this_thread::get_id()) {
+            throw std::logic_error("IOThreadPool::Stop() cannot be called from within its own thread.");
+        }
+    }
+
     if (!running_) return;
     running_ = false;
 
+    // 撤销工作守卫，使得 io_context 可以在执行完积压任务（如 gracefully 投递的 Close）后自然退出
     for (auto& guard : work_guards_) {
         guard.reset();
     }
 
-    for (auto& io_ctx : io_contexts_) {
-        io_ctx->stop();
-    }
-
     for (auto& t : threads_) {
         if (t.joinable()) {
-            if (t.get_id() == std::this_thread::get_id()) {
-                throw std::logic_error("IOThreadPool::Stop() cannot be called from within its own thread.");
-            } else {
-                t.join();
-            }
+            t.join();
         }
     }
     threads_.clear();
