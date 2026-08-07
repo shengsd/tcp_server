@@ -35,18 +35,17 @@ void IOThreadPool::Start() {
 }
 
 void IOThreadPool::Stop() {
-    for (auto& t : threads_) {
-        if (t.joinable() && t.get_id() == std::this_thread::get_id()) {
-            throw std::logic_error("IOThreadPool::Stop() cannot be called from within its own thread.");
-        }
-    }
-
     if (!running_) return;
     running_ = false;
 
     // 撤销工作守卫，使得 io_context 可以在执行完积压任务（如 gracefully 投递的 Close）后自然退出
     for (auto& guard : work_guards_) {
         guard.reset();
+    }
+    
+    // 强制终止剩余阻塞中的上下文，打破由异常连接造成的长期等待死锁
+    for (auto& io_ctx : io_contexts_) {
+        io_ctx->stop();
     }
 
     for (auto& t : threads_) {
@@ -55,6 +54,14 @@ void IOThreadPool::Stop() {
         }
     }
     threads_.clear();
+}
+
+bool IOThreadPool::IsCurrentThread() const {
+    auto current_id = std::this_thread::get_id();
+    for (const auto& t : threads_) {
+        if (t.get_id() == current_id) return true;
+    }
+    return false;
 }
 
 asio::io_context& IOThreadPool::GetNextIOContext() {

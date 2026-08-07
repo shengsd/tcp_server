@@ -1,6 +1,8 @@
 #include "net/tcp_server.h"
 #include <iostream>
 #include <stdexcept>
+#include <future>
+#include <atomic>
 
 namespace net {
 
@@ -53,6 +55,9 @@ void TcpServer::Stop() {
     if (acceptor_thread_.joinable() && acceptor_thread_.get_id() == std::this_thread::get_id()) {
         throw std::logic_error("TcpServer::Stop() cannot be called from the acceptor thread.");
     }
+    if (io_thread_pool_.IsCurrentThread()) {
+        throw std::logic_error("TcpServer::Stop() cannot be called from an IO worker thread.");
+    }
 
     if (!is_running_) return;
     is_running_ = false;
@@ -64,8 +69,25 @@ void TcpServer::Stop() {
         sessions_to_close.assign(active_sessions_.begin(), active_sessions_.end());
         // 交由内部回调进行 erase，不直接 clear()
     }
-    for (auto& session : sessions_to_close) {
-        session->Close();
+    
+    if (!sessions_to_close.empty()) {
+        auto count = std::make_shared<std::atomic<size_t>>(sessions_to_close.size());
+        auto promise = std::make_shared<std::promise<void>>();
+        auto future = promise->get_future();
+
+        for (auto& session : sessions_to_close) {
+            auto ex = session->GetSocket().get_executor();
+            session->Close(); // Close 内部已实现非阻塞投递
+
+            // 紧跟着投递计数检查，依靠同一队列的 FIFO 保证其在 Close 之后执行
+            asio::post(ex, [count, promise]() {
+                if (count->fetch_sub(1, std::memory_order_relaxed) == 1) {
+                    promise->set_value();
+                }
+            });
+        }
+        // 给所有 IO 线程最多 3 秒钟的优雅排空时间，确保用户回调体面结束
+        future.wait_for(std::chrono::seconds(3));
     }
 
     std::error_code ec;
@@ -120,9 +142,12 @@ void TcpServer::DoAccept() {
                 }
             }
 
-            if (!session->IsClosed()) {
-                session->Start();
-            }
+            // 将启动逻辑投递至其归属的 IO 线程，彻底封死极短时间窗内的读写与销毁竞态
+            asio::post(session->GetSocket().get_executor(), [session]() {
+                if (!session->IsClosed()) {
+                    session->Start();
+                }
+            });
         } else if (ec != asio::error::operation_aborted) {
             std::cerr << "[TcpServer] Accept error: " << ec.message() << std::endl;
         }

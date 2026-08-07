@@ -23,6 +23,7 @@ public:
 
     void Start();
     void Stop();
+    bool IsCurrentThread() const;
 
     // 轮询获取下一个 io_context
     asio::io_context& GetNextIOContext();
