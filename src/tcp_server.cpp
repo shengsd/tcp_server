@@ -1,5 +1,6 @@
 #include "net/tcp_server.h"
 #include <iostream>
+#include <stdexcept>
 
 namespace net {
 
@@ -70,7 +71,7 @@ void TcpServer::Stop() {
 
     if (acceptor_thread_.joinable()) {
         if (acceptor_thread_.get_id() == std::this_thread::get_id()) {
-            acceptor_thread_.detach();
+            throw std::logic_error("TcpServer::Stop() cannot be called from the acceptor thread.");
         } else {
             acceptor_thread_.join();
         }
@@ -100,6 +101,10 @@ void TcpServer::DoAccept() {
 
             {
                 std::lock_guard<std::mutex> lock(sessions_mutex_);
+                if (!is_running_) {
+                    // Stop 正在并发执行，服务器即将销毁，拒绝接管新会话
+                    return; 
+                }
                 active_sessions_.insert(session);
             }
 
@@ -109,11 +114,9 @@ void TcpServer::DoAccept() {
                 } catch (const std::exception& e) {
                     std::cerr << "[TcpServer] on_connect exception: " << e.what() << std::endl;
                     session->Close();
-                    return;
                 } catch (...) {
                     std::cerr << "[TcpServer] on_connect unknown exception" << std::endl;
                     session->Close();
-                    return;
                 }
             }
 

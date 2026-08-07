@@ -1,5 +1,6 @@
 #include "net/io_thread_pool.h"
 #include <iostream>
+#include <stdexcept>
 
 namespace net {
 
@@ -48,7 +49,7 @@ void IOThreadPool::Stop() {
     for (auto& t : threads_) {
         if (t.joinable()) {
             if (t.get_id() == std::this_thread::get_id()) {
-                t.detach();
+                throw std::logic_error("IOThreadPool::Stop() cannot be called from within its own thread.");
             } else {
                 t.join();
             }

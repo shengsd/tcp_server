@@ -33,13 +33,13 @@ void TcpSession::Start() {
 void TcpSession::Send(const uint8_t* data, std::size_t length) {
     if (is_closed_ || !data || length == 0) return;
 
-    if (current_send_queue_size_.load(std::memory_order_relaxed) + length > max_send_queue_size_) {
+    size_t old_size = current_send_queue_size_.fetch_add(length, std::memory_order_relaxed);
+    if (old_size + length > max_send_queue_size_) {
+        current_send_queue_size_.fetch_sub(length, std::memory_order_relaxed); // 回滚
         std::cerr << "[TcpSession] Send queue high watermark exceeded, closing connection." << std::endl;
         Close();
         return;
     }
-    
-    current_send_queue_size_.fetch_add(length, std::memory_order_relaxed);
 
     auto self(shared_from_this());
     std::vector<uint8_t> buffer(data, data + length);
@@ -112,11 +112,11 @@ void TcpSession::DoRead() {
                         on_message_(self, read_buffer_.data(), bytes_transferred);
                     } catch (const std::exception& e) {
                         std::cerr << "[TcpSession] on_message exception: " << e.what() << std::endl;
-                        HandleError(asio::error::make_error_code(asio::error::operation_aborted));
+                        Close();
                         return;
                     } catch (...) {
                         std::cerr << "[TcpSession] on_message unknown exception" << std::endl;
-                        HandleError(asio::error::make_error_code(asio::error::operation_aborted));
+                        Close();
                         return;
                     }
                 }
