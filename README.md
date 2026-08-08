@@ -2,6 +2,8 @@
 
 基于 Linux C++11 和 **Standalone Asio** 实现的高性能 TCP 服务端框架，采用 **One io_context per Thread (IO 线程池)** 架构，内置心跳超时检测、发送缓冲队列与 C++11 事件回调。
 
+> 📖 **详细架构设计与底层机制请参阅**：[DESIGN.md](file:///Users/shengsd/github/tcp_server/DESIGN.md)
+
 ---
 
 ## CentOS 7 构建指南

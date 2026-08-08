@@ -3,6 +3,7 @@ project(tcp_server CXX)
 
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # 强制定义 Standalone Asio 标志 (脱离 Boost 依赖)
 add_compile_definitions(ASIO_STANDALONE)
