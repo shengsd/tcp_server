@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.14)
 project(tcp_server CXX)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -54,3 +56,14 @@ target_link_libraries(tcp_server_lib PRIVATE Threads::Threads ${CMAKE_THREAD_LIB
 # 示例程序
 add_executable(tcp_server_example example/main.cpp)
 target_link_libraries(tcp_server_example PRIVATE tcp_server_lib Threads::Threads ${CMAKE_THREAD_LIBS_INIT})
+
+if (BUILD_TESTING)
+    add_executable(tcp_session_concurrency_test
+        tests/tcp_session_concurrency_test.cpp
+    )
+    target_link_libraries(tcp_session_concurrency_test
+        PRIVATE tcp_server_lib Threads::Threads ${CMAKE_THREAD_LIBS_INIT}
+    )
+    add_test(NAME tcp_session_concurrency_test COMMAND tcp_session_concurrency_test)
+    set_tests_properties(tcp_session_concurrency_test PROPERTIES TIMEOUT 15)
+endif()

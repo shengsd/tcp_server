@@ -129,8 +129,9 @@ void TcpSession::DoRead() {
 * **痛点**：Asio 底层规定在同一个 socket 上并发发起多个 `async_write` 是未定义行为（UB）。
 * **解决**：
   1. `Send()` 接口开放给任意外部业务线程；
-  2. 内部通过 `asio::post(socket_.get_executor(), ...)` 将发送数据包的任务投递到 Session 绑定的单一 IO 线程中；
+  2. 构造 Session 时缓存 socket 的 executor，内部通过 `asio::post(executor_, ...)` 将发送任务投递到绑定的单一 IO 线程中，避免业务线程访问共享 socket；
   3. 在 IO 线程内维护 `write_queue_`，严格保证上一个 `async_write` 完成触发回调后，才发起下一次 `async_write`。
+  4. 多个业务线程并发调用 `Send()` 时只保证写操作不会重叠，不承诺这些调用之间的全局发送顺序；需要严格顺序的协议应在业务层编号或统一投递。
 
 ```mermaid
 sequenceDiagram
@@ -158,6 +159,7 @@ sequenceDiagram
 * **解决**：
   - 引入 `current_send_queue_size_`（原子计数）和 `max_send_queue_size_`（默认 10MB）。
   - 每次 `Send()` 时通过 `fetch_add` 累加待发送字节数。如果超出阈值，立即回滚计数并主动切断连接（`Close()`）。
+  - 数据拷贝、任务投递、入队或异步写失败，以及关闭期间丢弃待发送数据时，都会回收对应计数。
 
 ---
 

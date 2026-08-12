@@ -32,13 +32,8 @@ void IOThreadPool::Start() {
     for (std::size_t i = 0; i < pool_size_; ++i) {
         // 创建工作线程，每个线程绑定其独立的 io_context 实例
         threads_.emplace_back([this, i]() {
-            try {
-                // 进入事件循环：阻塞等待并分发在该 io_context 注册的读/写/定时器事件
-                io_contexts_[i]->run();
-            } catch (const std::exception& e) {
-                // 捕获可能从 handler 逃逸的未捕获异常，防止工作线程直接 crash 整个进程
-                std::cerr << "[IOThreadPool] Thread " << i << " exception: " << e.what() << std::endl;
-            }
+            // 进入事件循环：阻塞等待并分发在该 io_context 注册的读/写/定时器事件
+            io_contexts_[i]->run();
         });
     }
 }

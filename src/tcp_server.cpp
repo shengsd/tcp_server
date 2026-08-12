@@ -52,11 +52,7 @@ void TcpServer::Start() {
 
     // 3. 在独立的子线程中运行主 Acceptor 事件循环，使 Start() 成为即刻返回的非阻塞调用
     acceptor_thread_ = std::thread([this]() {
-        try {
-            main_io_context_.run();
-        } catch (const std::exception& e) {
-            std::cerr << "[TcpServer] Main io_context exception: " << e.what() << std::endl;
-        }
+        main_io_context_.run();
     });
 }
 
@@ -154,22 +150,14 @@ void TcpServer::DoAccept() {
                 active_sessions_.insert(session);
             }
 
-            // 触发用户的连接建立通知回调（加入 try-catch 保护，防止用户异常导致服务器崩溃）
+            // 触发用户的连接建立通知回调
             if (on_connect_) {
-                try {
-                    on_connect_(session);
-                } catch (const std::exception& e) {
-                    std::cerr << "[TcpServer] on_connect exception: " << e.what() << std::endl;
-                    session->Close();
-                } catch (...) {
-                    std::cerr << "[TcpServer] on_connect unknown exception" << std::endl;
-                    session->Close();
-                }
+                on_connect_(session);
             }
 
             // 【关键跨线程投递】：将 session->Start() 投递至其归属的 IO 线程执行，
             // 确保后续所有的读写和定时器操作都在同一个专属线程中串行展开
-            asio::post(session->GetSocket().get_executor(), [session]() {
+            asio::post(session->GetExecutor(), [session]() {
                 if (!session->IsClosed()) {
                     session->Start();
                 }
