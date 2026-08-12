@@ -52,7 +52,9 @@ using OnErrorHandler = std::function<void(TcpSessionPtr session, const std::erro
  *    Lambda 闭包中。只要底层内核还有未决的 I/O 操作，该 Session 对象就绝对不会被提前析构，彻底消除悬空指针。
  * 2. 线程模型与串行化：每个 Session 在创建时绑定到一个特定的 IO 线程（io_context）。虽然 Send() 和 Close()
  *    允许从任意外部业务线程调用，但底层真正的 socket 读写、发送队列操作与定时器重置全部通过 asio::post
- *    排队在绑定的 IO 线程中串行执行，因此无需对 socket 加重锁。
+ *    排队在绑定的 executor 中串行执行。
+ *    注意：当前正确性依赖“One io_context 只有一个 run 线程”。若后续改为多线程 run 同一个 io_context，
+ *    则必须引入 explicit asio::strand 来保证串行。
  * 3. 发送背压机制（Backpressure）：内置发送队列与原子高水位限制，防止客户端因“慢网络/只读不读”导致服务端内存无底线暴涨。
  * 4. 心跳保活机制：内置入站数据空闲检测定时器，规定时间内无数据到达将主动切断僵尸连接。
  */
@@ -88,6 +90,8 @@ public:
      * 
      * 【特性与线程安全性】：
      * - 线程安全：可从任意业务线程并发调用。
+     * - 无全局顺序保证：由于多线程调用 asio::post 进入队列的顺序不可控，并发调用时无法保证先调用的必然先发送。
+     *   若业务强依赖顺序，上层需在业务层增加序号或在单一业务线程中投递。
      * - 内存语义：函数内部会立即深拷贝 data[0, length) 到缓冲区中，函数返回后调用方可立即释放原数据。
      * - 发送队列与背压：如果当前有未完成的写操作，数据将存入 write_queue_；如果当前排队总字节数超过
      *   max_send_queue_size_，将拒绝发送并自动触发 Close() 切断连接防 OOM。
@@ -152,6 +156,8 @@ public:
 private:
     friend class TcpServer;
 
+    using Executor = asio::ip::tcp::socket::executor_type;
+
     /**
      * @brief 内部带完成通知的关闭逻辑，供 TcpServer::Stop() 实现优雅排空与跨线程等待。
      * @param completion 关闭任务在 IO 线程完成后的通知函数
@@ -170,8 +176,18 @@ private:
     /** @brief 统一处理网络错误并执行后续清理 */
     void HandleError(const std::error_code& ec);
 
+    /** @brief 原子预留发送队列额度；返回 false 表示会超过高水位 */
+    bool TryReserveSendQueueBytes(std::size_t length);
+
+    /** @brief 在 IO 线程内清空发送队列，并同步回收对应的背压计数 */
+    void ClearWriteQueue();
+
+    /** @brief 返回构造时缓存的 executor，避免外部线程访问 socket 获取 executor */
+    const Executor& GetExecutor() const { return executor_; }
+
 private:
     asio::ip::tcp::socket socket_;             ///< 底层 TCP socket 对象
+    Executor executor_;                        ///< 构造时缓存，供任意线程安全地投递 Session 任务
     std::string remote_address_;               ///< 缓存的客户端 IP
     unsigned short remote_port_;               ///< 缓存的客户端 Port
     asio::steady_timer heartbeat_timer_;       ///< 心跳检测定时器

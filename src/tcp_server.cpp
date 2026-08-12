@@ -169,7 +169,7 @@ void TcpServer::DoAccept() {
 
             // 【关键跨线程投递】：将 session->Start() 投递至其归属的 IO 线程执行，
             // 确保后续所有的读写和定时器操作都在同一个专属线程中串行展开
-            asio::post(session->GetSocket().get_executor(), [session]() {
+            asio::post(session->GetExecutor(), [session]() {
                 if (!session->IsClosed()) {
                     session->Start();
                 }

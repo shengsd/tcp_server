@@ -6,7 +6,8 @@ namespace net {
 // 构造函数：接管已建立的 TCP socket，并缓存对端地址/端口信息
 TcpSession::TcpSession(asio::ip::tcp::socket socket, int heartbeat_timeout_s)
     : socket_(std::move(socket)),
-      heartbeat_timer_(socket_.get_executor()), // 定时器与 socket 绑定在相同的 executor（同一线程）
+      executor_(socket_.get_executor()),
+      heartbeat_timer_(executor_), // 定时器与 socket 绑定在相同的 executor（同一线程）
       heartbeat_timeout_s_(heartbeat_timeout_s),
       is_closed_(false),
       close_completed_(false) {
@@ -41,45 +42,69 @@ void TcpSession::Send(const uint8_t* data, std::size_t length) {
     // 快速前置判断：如果已关闭或数据为空则直接返回
     if (is_closed_ || !data || length == 0) return;
 
+    // 在修改背压计数前确认对象确实由 shared_ptr 管理，避免 shared_from_this()
+    // 因误用抛出 bad_weak_ptr 时留下无法回收的预留额度。
+    auto self(shared_from_this());
+
     // 1. 发送背压（Backpressure）与防 OOM 控制：
-    // 使用 fetch_add 原子的增加待发送队列字节总数，即使多线程并发调用 Send 也绝对准确
-    size_t old_size = current_send_queue_size_.fetch_add(length, std::memory_order_relaxed);
-    if (old_size + length > max_send_queue_size_) {
+    // 通过 CAS 在拷贝数据前预留额度，既避免 size_t 加法溢出，也避免多个业务线程同时突破高水位。
+    if (!TryReserveSendQueueBytes(length)) {
         // 超过高水位阈值（如 10MB）：说明客户端处理过慢/恶意不读取，产生积压。
-        // 回滚计数并主动切断连接，保全服务端内存不被耗尽
-        current_send_queue_size_.fetch_sub(length, std::memory_order_relaxed);
+        // 当前消息尚未计入队列，直接关闭连接，保全服务端内存不被耗尽。
         std::cerr << "[TcpSession] Send queue high watermark exceeded, closing connection." << std::endl;
         Close();
         return;
     }
 
-    // 2. 捕获自身 shared_ptr，防止闭包在执行前 Session 析构
-    auto self(shared_from_this());
-    // 深拷贝数据，使得调用方函数返回后可立即释放原数据缓冲区
-    std::vector<uint8_t> buffer(data, data + length);
+    try {
+        // 深拷贝数据，使得调用方函数返回后可立即释放原数据缓冲区
+        std::vector<uint8_t> buffer(data, data + length);
 
-    // 3. 将发送任务投递至该 Session 独占的 IO 线程 executor 中串行执行
-    struct SendTask {
-        TcpSession* session;
-        TcpSessionPtr self;
-        std::vector<uint8_t> buffer;
+        // 3. 将发送任务投递至该 Session 独占的 IO 线程 executor 中串行执行
+        struct SendTask {
+            TcpSession* session;
+            TcpSessionPtr self;
+            std::vector<uint8_t> buffer;
 
-        void operator()() {
-            // 如果连接在排队期间已被关闭，直接丢弃
-            if (session->is_closed_) return;
+            void operator()() {
+                const std::size_t len = buffer.size();
+                // 如果连接在排队期间已被关闭，直接丢弃并回滚计数
+                if (session->is_closed_) {
+                    session->current_send_queue_size_.fetch_sub(len, std::memory_order_relaxed);
+                    return;
+                }
 
-            // 检查当前是否已经有 async_write 正在进行中：
-            // 如果 write_queue_ 为空，说明当前没有写操作正在进行，塞入队列后需要立即触发 DoWrite()；
-            // 如果 write_queue_ 非空，说明已有底层 async_write 在飞，底层写完后会自动触发链式写入，这里仅入队即可。
-            bool write_in_progress = !session->write_queue_.empty();
-            session->write_queue_.push_back(std::move(buffer));
-            if (!write_in_progress) {
-                session->DoWrite();
+                // 检查当前是否已经有 async_write 正在进行中：
+                // 如果 write_queue_ 为空，说明当前没有写操作正在进行，塞入队列后需要立即触发 DoWrite()；
+                // 如果 write_queue_ 非空，说明已有底层 async_write 在飞，底层写完后会自动触发链式写入，这里仅入队即可。
+                bool write_in_progress = !session->write_queue_.empty();
+                try {
+                    session->write_queue_.push_back(std::move(buffer));
+                } catch (const std::exception& e) {
+                    // 处理极端情况（如 deque 扩容失败）
+                    session->current_send_queue_size_.fetch_sub(len, std::memory_order_relaxed);
+                    std::cerr << "[TcpSession] Failed to enqueue send buffer: " << e.what() << std::endl;
+                    session->Close();
+                    return;
+                } catch (...) {
+                    session->current_send_queue_size_.fetch_sub(len, std::memory_order_relaxed);
+                    std::cerr << "[TcpSession] Failed to enqueue send buffer: unknown exception" << std::endl;
+                    session->Close();
+                    return;
+                }
+
+                if (!write_in_progress) {
+                    session->DoWrite();
+                }
             }
-        }
-    };
+        };
 
-    asio::post(socket_.get_executor(), SendTask{this, self, std::move(buffer)});
+        asio::post(executor_, SendTask{this, self, std::move(buffer)});
+    } catch (...) {
+        // 捕获内存分配失败等异常，回滚背压计数
+        current_send_queue_size_.fetch_sub(length, std::memory_order_relaxed);
+        throw;
+    }
 }
 
 // 重载便捷方法：发送 string
@@ -99,7 +124,7 @@ void TcpSession::Close(std::function<void()> completion) {
 
     auto self(shared_from_this());
     // 第二步：将真正的 socket/timer 关闭操作投递至绑定的 IO 线程，彻底消除与读写 handler 的并发竞态
-    asio::post(socket_.get_executor(), [this, self, completion]() {
+    asio::post(executor_, [this, self, completion]() {
         // 使用 close_completed_ 标志位保证关闭逻辑在 IO 线程内【严格只执行一次】
         if (!close_completed_) {
             close_completed_ = true;
@@ -185,26 +210,75 @@ void TcpSession::DoRead() {
 // 异步写循环状态机（严格串行化发送队列中的数据）
 void TcpSession::DoWrite() {
     auto self(shared_from_this());
-    // 发送队列头部的第一块数据
-    asio::async_write(socket_, asio::buffer(write_queue_.front()),
-        [this, self](const std::error_code& ec, std::size_t /*bytes_transferred*/) {
-            if (is_closed_) return;
-
-            if (!ec) {
-                // 发送成功：从原子计数器中扣减已发送字节数
-                current_send_queue_size_.fetch_sub(write_queue_.front().size(), std::memory_order_relaxed);
-                // 弹出已发送完成的数据包
-                write_queue_.pop_front();
-
-                // 如果队列中还有后续排队的数据包，继续触发下一次 async_write
-                if (!write_queue_.empty()) {
-                    DoWrite();
+    try {
+        // 发送队列头部的第一块数据
+        asio::async_write(socket_, asio::buffer(write_queue_.front()),
+            [this, self](const std::error_code& ec, std::size_t /*bytes_transferred*/) {
+                if (is_closed_) {
+                    // socket 关闭后，当前 async_write 的 buffer 生命周期到此结束，
+                    // 现在可以安全释放整个队列并回收其背压计数。
+                    ClearWriteQueue();
+                    return;
                 }
-            } else {
-                // 发送失败，进入错误处理
-                HandleError(ec);
-            }
-        });
+
+                if (!ec) {
+                    // 发送成功：从原子计数器中扣减已发送字节数
+                    current_send_queue_size_.fetch_sub(write_queue_.front().size(), std::memory_order_relaxed);
+                    // 弹出已发送完成的数据包
+                    write_queue_.pop_front();
+
+                    // 如果队列中还有后续排队的数据包，继续触发下一次 async_write
+                    if (!write_queue_.empty()) {
+                        DoWrite();
+                    }
+                } else {
+                    // 当前写操作已经完成（失败），所有队列 buffer 都不再被底层 I/O 使用。
+                    ClearWriteQueue();
+                    // 发送失败，进入错误处理
+                    HandleError(ec);
+                }
+            });
+    } catch (const std::exception& e) {
+        // 异步操作发起阶段也可能因分配 handler 存储失败而抛异常，此时没有底层写操作持有 buffer。
+        ClearWriteQueue();
+        std::cerr << "[TcpSession] Failed to initiate async_write: " << e.what() << std::endl;
+        Close();
+    } catch (...) {
+        ClearWriteQueue();
+        std::cerr << "[TcpSession] Failed to initiate async_write: unknown exception" << std::endl;
+        Close();
+    }
+}
+
+bool TcpSession::TryReserveSendQueueBytes(std::size_t length) {
+    std::size_t current = current_send_queue_size_.load(std::memory_order_relaxed);
+    for (;;) {
+        // 使用减法判断，避免 current + length 发生 size_t 溢出。
+        if (length > max_send_queue_size_ || current > max_send_queue_size_ - length) {
+            return false;
+        }
+
+        if (current_send_queue_size_.compare_exchange_weak(
+                current,
+                current + length,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return true;
+        }
+        // CAS 失败时 current 已更新为最新值，继续重试。
+    }
+}
+
+void TcpSession::ClearWriteQueue() {
+    std::size_t bytes_to_release = 0;
+    for (const auto& buffer : write_queue_) {
+        bytes_to_release += buffer.size();
+    }
+    write_queue_.clear();
+
+    if (bytes_to_release != 0) {
+        current_send_queue_size_.fetch_sub(bytes_to_release, std::memory_order_relaxed);
+    }
 }
 
 // 刷新并重置心跳定时器
