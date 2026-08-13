@@ -1,271 +1,466 @@
 #include "net/tcp_session.h"
+
 #include <iostream>
+#include <stdexcept>
 
 namespace net {
 
-// 构造函数：接管已建立的 TCP socket，并缓存对端地址/端口信息
 TcpSession::TcpSession(asio::ip::tcp::socket socket, int heartbeat_timeout_s)
     : socket_(std::move(socket)),
       executor_(socket_.get_executor()),
-      heartbeat_timer_(executor_), // 定时器与 socket 绑定在相同的 executor（同一线程）
+      io_context_(&static_cast<asio::io_context&>(executor_.context())),
+      heartbeat_timer_(executor_),
       heartbeat_timeout_s_(heartbeat_timeout_s),
-      is_closed_(false),
-      close_completed_(false) {
+      state_(State::Open) {
     std::error_code ec;
-    // 在构造时主动获取并缓存对端 endpoint，即使后续 socket 关闭，地址信息也不会丢失
-    auto ep = socket_.remote_endpoint(ec);
+    const auto ep = socket_.remote_endpoint(ec);
     if (!ec) {
         remote_address_ = ep.address().to_string();
         remote_port_ = ep.port();
     }
 }
 
-// 析构函数：释放底层系统资源
 TcpSession::~TcpSession() {
     std::error_code ec;
-    heartbeat_timer_.cancel(ec); // 取消定时器
+    heartbeat_timer_.cancel(ec);
     if (socket_.is_open()) {
-        // shutdown 发送 FIN 包并关闭连接通道，避免连接处于 TIME_WAIT/半开悬垂状态
         socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
         socket_.close(ec);
     }
 }
 
-// 启动会话：开启心跳检测并挂起第一次异步读
 void TcpSession::Start() {
+    if (state_.load(std::memory_order_acquire) != State::Open) {
+        return;
+    }
     ResetHeartbeatTimer();
     DoRead();
 }
 
-// 异步发送数据（支持多线程并发调用）
 void TcpSession::Send(const uint8_t* data, std::size_t length) {
-    // 快速前置判断：如果已关闭或数据为空则直接返回
-    if (is_closed_ || !data || length == 0) return;
-
-    // 在修改背压计数前确认对象确实由 shared_ptr 管理，避免 shared_from_this()
-    // 因误用抛出 bad_weak_ptr 时留下无法回收的预留额度。
-    auto self(shared_from_this());
-
-    // 1. 发送背压（Backpressure）与防 OOM 控制：
-    // 通过 CAS 在拷贝数据前预留额度，既避免 size_t 加法溢出，也避免多个业务线程同时突破高水位。
-    if (!TryReserveSendQueueBytes(length)) {
-        // 超过高水位阈值（如 10MB）：说明客户端处理过慢/恶意不读取，产生积压。
-        // 当前消息尚未计入队列，直接关闭连接，保全服务端内存不被耗尽。
-        std::cerr << "[TcpSession] Send queue high watermark exceeded, closing connection." << std::endl;
-        Close();
+    if (!data || length == 0 ||
+        state_.load(std::memory_order_acquire) != State::Open) {
         return;
     }
 
-    try {
-        // 深拷贝数据，使得调用方函数返回后可立即释放原数据缓冲区
-        std::vector<uint8_t> buffer(data, data + length);
+    auto self = shared_from_this();
+    bool high_watermark_exceeded = false;
+    {
+        // Close 也持有此锁完成 Open -> Draining，使“关闭前已接受的发送”有明确线性化边界。
+        std::lock_guard<std::mutex> lock(admission_mutex_);
+        if (state_.load(std::memory_order_acquire) != State::Open) {
+            return;
+        }
 
-        // 3. 将发送任务投递至该 Session 独占的 IO 线程 executor 中串行执行
-        struct SendTask {
-            TcpSession* session;
-            TcpSessionPtr self;
-            std::vector<uint8_t> buffer;
+        if (!TryReserveSendQueueBytes(length)) {
+            high_watermark_exceeded = true;
+        } else {
+            bool pending_task_registered = false;
+            try {
+                // 先预留背压额度再拷贝，避免超大单包在被拒绝前造成无约束分配。
+                std::vector<uint8_t> buffer(data, data + length);
+                auto buffer_holder =
+                    std::make_shared<std::vector<uint8_t>>(std::move(buffer));
+                pending_send_tasks_.fetch_add(1, std::memory_order_relaxed);
+                pending_task_registered = true;
+                asio::post(executor_, [this, self, buffer_holder]() {
+                    const std::size_t len = buffer_holder->size();
+                    const State state = state_.load(std::memory_order_acquire);
 
-            void operator()() {
-                const std::size_t len = buffer.size();
-                // 如果连接在排队期间已被关闭，直接丢弃并回滚计数
-                if (session->is_closed_) {
-                    session->current_send_queue_size_.fetch_sub(len, std::memory_order_relaxed);
-                    return;
+                    if (state == State::Closing || state == State::Closed) {
+                        current_send_queue_size_.fetch_sub(len, std::memory_order_relaxed);
+                    } else {
+                        try {
+                            write_queue_.push_back(std::move(*buffer_holder));
+                        } catch (const std::exception& e) {
+                            current_send_queue_size_.fetch_sub(len, std::memory_order_relaxed);
+                            std::cerr << "[TcpSession] Failed to enqueue send buffer: "
+                                      << e.what() << std::endl;
+                            pending_send_tasks_.fetch_sub(1, std::memory_order_relaxed);
+                            ForceCloseOnExecutor(false, true);
+                            return;
+                        } catch (...) {
+                            current_send_queue_size_.fetch_sub(len, std::memory_order_relaxed);
+                            std::cerr << "[TcpSession] Failed to enqueue send buffer: unknown exception"
+                                      << std::endl;
+                            pending_send_tasks_.fetch_sub(1, std::memory_order_relaxed);
+                            ForceCloseOnExecutor(false, true);
+                            return;
+                        }
+
+                        if (!write_in_progress_) {
+                            DoWrite();
+                        }
+                    }
+
+                    pending_send_tasks_.fetch_sub(1, std::memory_order_relaxed);
+                    if (state_.load(std::memory_order_acquire) == State::Draining) {
+                        MaybeFinishDrain();
+                    } else if (state_.load(std::memory_order_acquire) == State::Closing) {
+                        MaybeFinalizeForcedClose();
+                    }
+                });
+            } catch (...) {
+                if (pending_task_registered) {
+                    pending_send_tasks_.fetch_sub(1, std::memory_order_relaxed);
                 }
-
-                // 检查当前是否已经有 async_write 正在进行中：
-                // 如果 write_queue_ 为空，说明当前没有写操作正在进行，塞入队列后需要立即触发 DoWrite()；
-                // 如果 write_queue_ 非空，说明已有底层 async_write 在飞，底层写完后会自动触发链式写入，这里仅入队即可。
-                bool write_in_progress = !session->write_queue_.empty();
-                try {
-                    session->write_queue_.push_back(std::move(buffer));
-                } catch (const std::exception& e) {
-                    // 处理极端情况（如 deque 扩容失败）
-                    session->current_send_queue_size_.fetch_sub(len, std::memory_order_relaxed);
-                    std::cerr << "[TcpSession] Failed to enqueue send buffer: " << e.what() << std::endl;
-                    session->Close();
-                    return;
-                } catch (...) {
-                    session->current_send_queue_size_.fetch_sub(len, std::memory_order_relaxed);
-                    std::cerr << "[TcpSession] Failed to enqueue send buffer: unknown exception" << std::endl;
-                    session->Close();
-                    return;
-                }
-
-                if (!write_in_progress) {
-                    session->DoWrite();
-                }
+                current_send_queue_size_.fetch_sub(length, std::memory_order_relaxed);
+                throw;
             }
-        };
+        }
+    }
 
-        asio::post(executor_, SendTask{this, self, std::move(buffer)});
-    } catch (...) {
-        // 捕获内存分配失败等异常，回滚背压计数
-        current_send_queue_size_.fetch_sub(length, std::memory_order_relaxed);
-        throw;
+    if (high_watermark_exceeded) {
+        std::cerr << "[TcpSession] Send queue high watermark exceeded, closing connection."
+                  << std::endl;
+        RequestAsyncClose();
     }
 }
 
-// 重载便捷方法：发送 string
 void TcpSession::Send(const std::string& message) {
     Send(reinterpret_cast<const uint8_t*>(message.data()), message.size());
 }
 
-// 公开的 Close 方法
-void TcpSession::Close() {
-    Close(std::function<void()>());
+bool TcpSession::Close(std::chrono::milliseconds timeout) {
+    if (RunningInThisIoThread()) {
+        throw std::logic_error(
+            "TcpSession::Close() cannot wait from the session's IO thread.");
+    }
+
+    BeginActiveClose();
+    return WaitForClose(timeout);
 }
 
-// 内部核心关闭实现：支持外部传入完成回调（用于 TcpServer::Stop 优雅排空等待）
-void TcpSession::Close(std::function<void()> completion) {
-    // 第一步：原子标记快速拦截后续的所有业务 Send / Read 请求
-    is_closed_.store(true, std::memory_order_release);
+bool TcpSession::IsClosed() const {
+    return state_.load(std::memory_order_acquire) != State::Open;
+}
 
-    auto self(shared_from_this());
-    // 第二步：将真正的 socket/timer 关闭操作投递至绑定的 IO 线程，彻底消除与读写 handler 的并发竞态
-    asio::post(executor_, [this, self, completion]() {
-        // 使用 close_completed_ 标志位保证关闭逻辑在 IO 线程内【严格只执行一次】
-        if (!close_completed_) {
-            close_completed_ = true;
+void TcpSession::BeginActiveClose() {
+    auto self = shared_from_this();
+    // 先发布主动关闭标志阻断新回调；已进入的回调由 FinalizeCloseOnExecutor 的门闩等待。
+    // Begin 本身不等待回调，使 TcpServer::Stop 能先让所有 Session 并行进入 Draining。
+    std::lock_guard<std::mutex> admission_lock(admission_mutex_);
+    active_close_requested_.store(true, std::memory_order_release);
+    if (state_.load(std::memory_order_acquire) != State::Open) {
+        return;
+    }
 
-            std::error_code ec;
-            // 取消心跳定时器（会立即触发 timer 的 async_wait 回调，错误码为 operation_aborted）
-            heartbeat_timer_.cancel(ec);
+    {
+        std::lock_guard<std::mutex> close_lock(close_mutex_);
+        drain_succeeded_ = true;
+    }
+    state_.store(State::Draining, std::memory_order_release);
 
-            // 关闭 TCP 套接字
-            if (socket_.is_open()) {
-                socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
-                socket_.close(ec);
-            }
+    try {
+        asio::post(executor_, [this, self]() { BeginDrainOnExecutor(); });
+    } catch (...) {
+        state_.store(State::Open, std::memory_order_release);
+        active_close_requested_.store(false, std::memory_order_release);
+        throw;
+    }
+}
 
-            // 触发用户的 on_close 回调（添加 try-catch 保护，防止用户回调抛异常影响框架）
-            if (on_close_) {
-                try {
-                    on_close_(self);
-                } catch (const std::exception& e) {
-                    std::cerr << "[TcpSession] on_close exception: " << e.what() << std::endl;
-                } catch (...) {
-                    std::cerr << "[TcpSession] on_close unknown exception" << std::endl;
-                }
-            }
+bool TcpSession::WaitForClose(std::chrono::milliseconds timeout) {
+    if (!WaitUntilClosed(timeout)) {
+        ForceActiveClose();
+    }
+    return WaitForCloseCompletion();
+}
 
-            // 触发服务器内部的容器剔除回调（从 active_sessions_ 中 erase 自己）
-            if (internal_close_handler_) {
-                try {
-                    internal_close_handler_(self);
-                } catch (...) {}
-            }
+bool TcpSession::WaitUntilClosed(std::chrono::milliseconds timeout) {
+    if (timeout.count() < 0) {
+        timeout = std::chrono::milliseconds(0);
+    }
+
+    std::unique_lock<std::mutex> lock(close_mutex_);
+    return close_cv_.wait_for(lock, timeout, [this]() {
+            return state_.load(std::memory_order_acquire) == State::Closed;
+        });
+}
+
+void TcpSession::ForceActiveClose() {
+    bool should_force = false;
+    {
+        std::lock_guard<std::mutex> lock(close_mutex_);
+        const State state = state_.load(std::memory_order_acquire);
+        if (state == State::Closed ||
+            (drain_succeeded_ &&
+             pending_send_tasks_.load(std::memory_order_acquire) == 0 &&
+             current_send_queue_size_.load(std::memory_order_acquire) == 0)) {
+            // 发送已经排空，当前只是在等待 IO handler/用户回调形成最终屏障；
+            // 该等待不受发送 timeout 限制。
+            return;
         }
+        should_force = !force_close_posted_;
+        force_close_posted_ = true;
+        drain_succeeded_ = false;
+    }
 
-        // 如果调用方传递了完成通知（如 TcpServer::Stop 中的 promise），在此处唤醒等待线程
-        if (completion) {
-            try {
-                completion();
-            } catch (const std::exception& e) {
-                std::cerr << "[TcpSession] close completion exception: " << e.what() << std::endl;
-            } catch (...) {
-                std::cerr << "[TcpSession] close completion unknown exception" << std::endl;
-            }
-        }
+    if (should_force) {
+        auto self = shared_from_this();
+        asio::post(executor_, [this, self]() {
+            ForceCloseOnExecutor(false, false);
+        });
+    }
+}
+
+bool TcpSession::WaitForCloseCompletion() {
+    std::unique_lock<std::mutex> lock(close_mutex_);
+    close_cv_.wait(lock, [this]() {
+        return state_.load(std::memory_order_acquire) == State::Closed;
     });
+    return drain_succeeded_;
 }
 
-// 异步读循环状态机
+void TcpSession::RequestAsyncClose() {
+    auto self = shared_from_this();
+    std::lock_guard<std::mutex> admission_lock(admission_mutex_);
+    if (state_.load(std::memory_order_acquire) != State::Open) {
+        return;
+    }
+
+    state_.store(State::Closing, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> close_lock(close_mutex_);
+        drain_succeeded_ = false;
+    }
+
+    try {
+        asio::post(executor_, [this, self]() {
+            ForceCloseOnExecutor(false, true);
+        });
+    } catch (...) {
+        state_.store(State::Open, std::memory_order_release);
+        throw;
+    }
+}
+
+void TcpSession::BeginDrainOnExecutor() {
+    if (state_.load(std::memory_order_acquire) != State::Draining) {
+        return;
+    }
+
+    std::error_code ec;
+    heartbeat_timer_.cancel(ec);
+    // 停止入站消息和 on_message，同时保留发送方向供 write_queue_ 排空。
+    if (socket_.is_open()) {
+        socket_.shutdown(asio::ip::tcp::socket::shutdown_receive, ec);
+    }
+    MaybeFinishDrain();
+}
+
+void TcpSession::MaybeFinishDrain() {
+    if (state_.load(std::memory_order_acquire) != State::Draining) {
+        return;
+    }
+    if (pending_send_tasks_.load(std::memory_order_acquire) != 0 ||
+        write_in_progress_ || !write_queue_.empty()) {
+        return;
+    }
+
+    state_.store(State::Closing, std::memory_order_release);
+    std::error_code ec;
+    if (socket_.is_open()) {
+        socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+        socket_.close(ec);
+    }
+    FinalizeCloseOnExecutor();
+}
+
+void TcpSession::ForceCloseOnExecutor(bool drained, bool notify_close) {
+    const State current = state_.load(std::memory_order_acquire);
+    if (current == State::Closed) {
+        return;
+    }
+
+    if (current == State::Open || current == State::Draining) {
+        std::lock_guard<std::mutex> admission_lock(admission_mutex_);
+        if (state_.load(std::memory_order_acquire) == State::Open ||
+            state_.load(std::memory_order_acquire) == State::Draining) {
+            state_.store(State::Closing, std::memory_order_release);
+        }
+    }
+
+    notify_close_on_finalize_ = notify_close_on_finalize_ || notify_close;
+    if (!drained) {
+        std::lock_guard<std::mutex> close_lock(close_mutex_);
+        drain_succeeded_ = false;
+    }
+
+    std::error_code ec;
+    heartbeat_timer_.cancel(ec);
+    if (socket_.is_open()) {
+        socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+        socket_.close(ec);
+    }
+    MaybeFinalizeForcedClose();
+}
+
+void TcpSession::MaybeFinalizeForcedClose() {
+    if (state_.load(std::memory_order_acquire) != State::Closing) {
+        return;
+    }
+    if (pending_send_tasks_.load(std::memory_order_acquire) != 0 || write_in_progress_) {
+        return;
+    }
+
+    ClearWriteQueue();
+    FinalizeCloseOnExecutor();
+}
+
+void TcpSession::FinalizeCloseOnExecutor() {
+    if (state_.load(std::memory_order_acquire) == State::Closed) {
+        return;
+    }
+
+    auto self = shared_from_this();
+    OnCloseHandler on_close;
+    std::function<void(TcpSessionPtr)> internal_close =
+        std::move(internal_close_handler_);
+    internal_close_handler_ = std::function<void(TcpSessionPtr)>();
+
+    {
+        // 主动 Close 与全部用户回调在此门闩上线性化；门闩释放后回调对象已全部清空。
+        std::lock_guard<std::mutex> callback_lock(callback_mutex_);
+        on_close = std::move(on_close_);
+        on_message_ = OnMessageHandler();
+        on_error_ = OnErrorHandler();
+        on_close_ = OnCloseHandler();
+
+        if (!active_close_requested_.load(std::memory_order_acquire) &&
+            notify_close_on_finalize_ && on_close) {
+            try {
+                on_close(self);
+            } catch (const std::exception& e) {
+                std::cerr << "[TcpSession] on_close exception: " << e.what()
+                          << std::endl;
+            } catch (...) {
+                std::cerr << "[TcpSession] on_close unknown exception" << std::endl;
+            }
+        }
+    }
+
+    if (internal_close) {
+        try {
+            internal_close(self);
+        } catch (...) {
+        }
+    }
+
+    // Closed 必须最后发布：同步 Close 观察到它时，用户回调和内部移除均已返回。
+    state_.store(State::Closed, std::memory_order_release);
+    close_cv_.notify_all();
+}
+
 void TcpSession::DoRead() {
-    // 捕获 self 保持当前异步调用期间 Session 对象存活
-    auto self(shared_from_this());
+    auto self = shared_from_this();
     socket_.async_read_some(asio::buffer(read_buffer_),
         [this, self](const std::error_code& ec, std::size_t bytes_transferred) {
-            // 如果连接已关闭，直接中断循环
-            if (is_closed_) return;
+            if (state_.load(std::memory_order_acquire) != State::Open) {
+                return;
+            }
 
             if (!ec) {
-                // 收到新数据，重置心跳超时计时器
                 ResetHeartbeatTimer();
-
-                // 将数据分发给业务层的 on_message 回调
-                if (on_message_) {
-                    try {
-                        on_message_(self, read_buffer_.data(), bytes_transferred);
-                    } catch (const std::exception& e) {
-                        std::cerr << "[TcpSession] on_message exception: " << e.what() << std::endl;
-                        Close();
-                        return;
-                    } catch (...) {
-                        std::cerr << "[TcpSession] on_message unknown exception" << std::endl;
-                        Close();
-                        return;
+                bool callback_failed = false;
+                {
+                    std::lock_guard<std::mutex> callback_lock(callback_mutex_);
+                    if (state_.load(std::memory_order_acquire) == State::Open &&
+                        !active_close_requested_.load(std::memory_order_acquire) &&
+                        on_message_) {
+                        try {
+                            on_message_(self, read_buffer_.data(), bytes_transferred);
+                        } catch (const std::exception& e) {
+                            std::cerr << "[TcpSession] on_message exception: " << e.what()
+                                      << std::endl;
+                            callback_failed = true;
+                        } catch (...) {
+                            std::cerr << "[TcpSession] on_message unknown exception"
+                                      << std::endl;
+                            callback_failed = true;
+                        }
                     }
                 }
-                // 递归（挂起）下一次异步读
-                DoRead();
+
+                if (callback_failed) {
+                    ForceCloseOnExecutor(false, true);
+                    return;
+                }
+
+                if (state_.load(std::memory_order_acquire) == State::Open) {
+                    DoRead();
+                }
             } else {
-                // 发生错误（如对端正常断开 EOF 或网络中断），进入统一错误处理
                 HandleError(ec);
             }
         });
 }
 
-// 异步写循环状态机（严格串行化发送队列中的数据）
 void TcpSession::DoWrite() {
-    auto self(shared_from_this());
+    if (write_queue_.empty() || write_in_progress_) {
+        return;
+    }
+
+    auto self = shared_from_this();
+    write_in_progress_ = true;
     try {
-        // 发送队列头部的第一块数据
         asio::async_write(socket_, asio::buffer(write_queue_.front()),
             [this, self](const std::error_code& ec, std::size_t /*bytes_transferred*/) {
-                if (is_closed_) {
-                    // socket 关闭后，当前 async_write 的 buffer 生命周期到此结束，
-                    // 现在可以安全释放整个队列并回收其背压计数。
-                    ClearWriteQueue();
-                    return;
-                }
+                write_in_progress_ = false;
 
                 if (!ec) {
-                    // 发送成功：从原子计数器中扣减已发送字节数
-                    current_send_queue_size_.fetch_sub(write_queue_.front().size(), std::memory_order_relaxed);
-                    // 弹出已发送完成的数据包
+                    current_send_queue_size_.fetch_sub(
+                        write_queue_.front().size(), std::memory_order_relaxed);
                     write_queue_.pop_front();
 
-                    // 如果队列中还有后续排队的数据包，继续触发下一次 async_write
-                    if (!write_queue_.empty()) {
-                        DoWrite();
+                    const State state = state_.load(std::memory_order_acquire);
+                    if (state == State::Open || state == State::Draining) {
+                        if (!write_queue_.empty()) {
+                            DoWrite();
+                        } else if (state == State::Draining) {
+                            MaybeFinishDrain();
+                        }
+                    } else {
+                        MaybeFinalizeForcedClose();
                     }
                 } else {
-                    // 当前写操作已经完成（失败），所有队列 buffer 都不再被底层 I/O 使用。
+                    const State state = state_.load(std::memory_order_acquire);
                     ClearWriteQueue();
-                    // 发送失败，进入错误处理
-                    HandleError(ec);
+                    if (state == State::Open) {
+                        HandleError(ec);
+                    } else if (state == State::Draining) {
+                        ForceCloseOnExecutor(false, false);
+                    } else {
+                        MaybeFinalizeForcedClose();
+                    }
                 }
             });
     } catch (const std::exception& e) {
-        // 异步操作发起阶段也可能因分配 handler 存储失败而抛异常，此时没有底层写操作持有 buffer。
+        write_in_progress_ = false;
         ClearWriteQueue();
-        std::cerr << "[TcpSession] Failed to initiate async_write: " << e.what() << std::endl;
-        Close();
+        std::cerr << "[TcpSession] Failed to initiate async_write: " << e.what()
+                  << std::endl;
+        ForceCloseOnExecutor(false, true);
     } catch (...) {
+        write_in_progress_ = false;
         ClearWriteQueue();
-        std::cerr << "[TcpSession] Failed to initiate async_write: unknown exception" << std::endl;
-        Close();
+        std::cerr << "[TcpSession] Failed to initiate async_write: unknown exception"
+                  << std::endl;
+        ForceCloseOnExecutor(false, true);
     }
 }
 
 bool TcpSession::TryReserveSendQueueBytes(std::size_t length) {
     std::size_t current = current_send_queue_size_.load(std::memory_order_relaxed);
     for (;;) {
-        // 使用减法判断，避免 current + length 发生 size_t 溢出。
         if (length > max_send_queue_size_ || current > max_send_queue_size_ - length) {
             return false;
         }
-
         if (current_send_queue_size_.compare_exchange_weak(
-                current,
-                current + length,
-                std::memory_order_relaxed,
-                std::memory_order_relaxed)) {
+                current, current + length,
+                std::memory_order_relaxed, std::memory_order_relaxed)) {
             return true;
         }
-        // CAS 失败时 current 已更新为最新值，继续重试。
     }
 }
 
@@ -275,49 +470,53 @@ void TcpSession::ClearWriteQueue() {
         bytes_to_release += buffer.size();
     }
     write_queue_.clear();
-
     if (bytes_to_release != 0) {
         current_send_queue_size_.fetch_sub(bytes_to_release, std::memory_order_relaxed);
     }
 }
 
-// 刷新并重置心跳定时器
 void TcpSession::ResetHeartbeatTimer() {
-    if (heartbeat_timeout_s_ <= 0) return; // 禁用心跳
-
-    // 设置过期时间点为当前时间 + 超时秒数
-    heartbeat_timer_.expires_after(std::chrono::seconds(heartbeat_timeout_s_));
-
-    auto self(shared_from_this());
-    heartbeat_timer_.async_wait([this, self](const std::error_code& ec) {
-        if (!ec) {
-            // 定时器正常触发（未被中途 cancel 且未发生错误），说明超时时间内没有收到任何数据包
-            std::cerr << "[TcpSession] Heartbeat timeout from " << remote_address_ << ":" << remote_port_ << ", closing." << std::endl;
-            Close();
-        }
-        // 如果 ec == asio::error::operation_aborted 说明被 ResetHeartbeatTimer() 重新刷新或连接已关闭，属正常现象
-    });
-}
-
-// 统一网络 I/O 错误处理
-void TcpSession::HandleError(const std::error_code& ec) {
-    // operation_aborted 是主动 cancel 引起的操作取消，不需要触发用户错误回调
-    if (ec == asio::error::operation_aborted) {
+    if (heartbeat_timeout_s_ <= 0 ||
+        state_.load(std::memory_order_acquire) != State::Open) {
         return;
     }
 
-    // 触发用户的错误回调
-    if (on_error_) {
-        try {
-            on_error_(shared_from_this(), ec);
-        } catch (const std::exception& e) {
-            std::cerr << "[TcpSession] on_error exception: " << e.what() << std::endl;
-        } catch (...) {
-            std::cerr << "[TcpSession] on_error unknown exception" << std::endl;
+    heartbeat_timer_.expires_after(std::chrono::seconds(heartbeat_timeout_s_));
+    auto self = shared_from_this();
+    heartbeat_timer_.async_wait([this, self](const std::error_code& ec) {
+        if (!ec && state_.load(std::memory_order_acquire) == State::Open) {
+            std::cerr << "[TcpSession] Heartbeat timeout from " << remote_address_
+                      << ":" << remote_port_ << ", closing." << std::endl;
+            ForceCloseOnExecutor(false, true);
+        }
+    });
+}
+
+void TcpSession::HandleError(const std::error_code& ec) {
+    if (state_.load(std::memory_order_acquire) != State::Open ||
+        ec == asio::error::operation_aborted) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> callback_lock(callback_mutex_);
+        if (state_.load(std::memory_order_acquire) == State::Open &&
+            !active_close_requested_.load(std::memory_order_acquire) && on_error_) {
+            try {
+                on_error_(shared_from_this(), ec);
+            } catch (const std::exception& e) {
+                std::cerr << "[TcpSession] on_error exception: " << e.what()
+                          << std::endl;
+            } catch (...) {
+                std::cerr << "[TcpSession] on_error unknown exception" << std::endl;
+            }
         }
     }
-    // 发生网络故障后，自动触发关闭收尾流程
-    Close();
+    ForceCloseOnExecutor(false, true);
+}
+
+bool TcpSession::RunningInThisIoThread() const {
+    return io_context_->get_executor().running_in_this_thread();
 }
 
 } // namespace net

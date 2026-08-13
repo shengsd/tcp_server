@@ -81,10 +81,10 @@ classDiagram
         -asio::steady_timer heartbeat_timer_
         -deque~vector~uint8_t~~ write_queue_
         -atomic~size_t~ current_send_queue_size_
-        -atomic~bool~ is_closed_
+        -atomic~State~ state_
         +Start() void
         +Send(data, len) void
-        +Close() void
+        +Close(timeout) bool
         +GetSocket() socket&
     }
 
@@ -164,7 +164,17 @@ sequenceDiagram
 ---
 
 ### 3.4 优雅停机与排空机制（Graceful Shutdown）
-服务端关闭（`TcpServer::Stop()`）遵循严格的时序保证：
+公开 `TcpSession::Close(timeout)` 是面向业务对象销毁的同步回调屏障：
+
+- 在调用线程把状态从 `Open` 切换为 `Draining`，从该线性化点开始拒绝新 `Send()` 并抑制新业务回调。
+- 已经接受但尚未进入 IO 队列的发送任务通过 `pending_send_tasks_` 跟踪，确保不会被提前漏过。
+- 排空期间关闭接收方向并取消心跳，只继续链式发送已有消息；timeout 到期则关闭 socket 并丢弃余量。
+- timeout 只限制发送排空，不能中断正在执行的业务回调；最终仍等待业务回调退出、清空回调对象并执行内部移除。
+- 主动同步关闭不触发 `on_error/on_close`；网络错误、对端断开和心跳超时仍正常触发这些回调。
+- 禁止从 Session IO 线程调用同步 `Close()`，否则接口会提前抛出 `logic_error`，避免等待自身 handler。
+- `true` 表示消息排空后关闭，`false` 表示发送超时或网络错误；排空仅表示 Asio 已完成写入，不代表对端业务确认。
+
+服务端关闭（`TcpServer::Stop()`）让全部 Session 并行进入 Draining，并共享三秒发送截止时间：
 
 ```mermaid
 sequenceDiagram
@@ -177,9 +187,11 @@ sequenceDiagram
     Server->>Server: 防死锁检查 (禁止在 IO 线程内调用)
     Server->>Server: 抓取 active_sessions_ 快照
     loop 遍历所有活跃会话
-        Server->>Session: session->Close(completion_promise)
+        Server->>Session: BeginActiveClose()
     end
-    Server->>Server: 等待所有会话关闭完成 (最多 3 秒宽限期)
+    Server->>Server: 共享截止时间内等待发送排空
+    Server->>Session: 超时会话 ForceActiveClose()
+    Server->>Server: 等待全部回调屏障完成
     Server->>Server: acceptor_.close() 停止接收新连接
     Server->>IO: io_thread_pool_.Stop() (释放 work_guard 并 stop)
     Server->>Main: 所有资源安全回收，Stop() 返回
@@ -193,8 +205,25 @@ sequenceDiagram
 | :--- | :--- | :--- |
 | `OnConnectHandler` | **主 Acceptor 线程** | 新客户端握手成功后触发。回调完成后，会话才会在 IO 线程启动读取。 |
 | `OnMessageHandler` | **Session 归属 IO 线程** | 收到新数据时触发。`data` 仅在回调函数返回前有效，如需异步跨线程使用**必须自行深拷贝**。 |
-| `OnCloseHandler` | **Session 归属 IO 线程** | 当底层 socket 和定时器完全关闭后触发，**保证每个连接只触发一次**。 |
-| `OnErrorHandler` | **Session 归属 IO 线程** | 发生非主动取消的网络异常时触发，随后框架会自动进入关闭流程。 |
+| `OnCloseHandler` | **Session 归属 IO 线程** | 网络/心跳关闭后触发一次；主动同步 `Close()` 为避免业务对象销毁重入而抑制。 |
+| `OnErrorHandler` | **Session 归属 IO 线程** | 非主动网络异常时触发；主动同步 `Close()` 后不再触发。 |
+
+### 4.1 上层业务对象安全销毁
+
+如果 Session 回调会查找并调用上层客户端对象的裸指针，必须先建立回调屏障，再释放业务对象：
+
+```cpp
+void Client::uninit() {
+    if (session_) {
+        const bool drained = session_->Close(std::chrono::seconds(3));
+        session_.reset();
+        // drained == false 表示发送超时或网络错误，但回调屏障仍已完成。
+    }
+    // 此后才可释放会被回调访问的其他成员。
+}
+```
+
+`uninit()` 必须由 Session IO 线程以外的对象管理线程调用，且等待期间不能持有业务回调也会获取的锁。全局客户端表自身的查询、移除与 `delete` 仍需由上层加锁或串行化。
 
 ---
 

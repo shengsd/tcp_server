@@ -1,8 +1,7 @@
 #include "net/tcp_server.h"
 #include <iostream>
 #include <stdexcept>
-#include <future>
-#include <atomic>
+#include <chrono>
 
 namespace net {
 
@@ -81,24 +80,36 @@ void TcpServer::Stop() {
         // 注意：不在这里直接 clear() active_sessions_，而是由各会话完成关闭回调后自行 erase
     }
 
-    // 2. 优雅排空机制：向所有会话投递异步 Close，并设置 3 秒宽限期等待未竟数据收尾
-    if (!sessions_to_close.empty()) {
-        auto count = std::make_shared<std::atomic<size_t>>(sessions_to_close.size());
-        auto promise = std::make_shared<std::promise<void>>();
-        auto future = promise->get_future();
+    // 2. 先让全部 Session 并行进入 Draining，再以同一截止时间依次等待。
+    //    截止时间到达后先强关所有未完成 Session，再等待完整回调屏障。
+    for (auto& session : sessions_to_close) {
+        session->BeginActiveClose();
+    }
 
-        for (auto& session : sessions_to_close) {
-            // 异步关闭完成通知：当所有 Session 的 Close 任务都在所属 IO 线程执行完成后递减原子计数
-            session->Close([count, promise]() {
-                if (count->fetch_sub(1, std::memory_order_relaxed) == 1) {
-                    promise->set_value(); // 所有连接均已完成关闭
-                }
-            });
+    const auto drain_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    bool deadline_reached = false;
+    for (auto& session : sessions_to_close) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto remaining = now < drain_deadline
+            ? std::chrono::duration_cast<std::chrono::milliseconds>(drain_deadline - now)
+            : std::chrono::milliseconds(0);
+        if (!session->WaitUntilClosed(remaining)) {
+            deadline_reached = true;
+            break;
         }
+    }
 
-        // 等待所有连接优雅关闭，最多等待 3 秒宽限期
-        if (future.wait_for(std::chrono::seconds(3)) == std::future_status::timeout) {
-            std::cerr << "[TcpServer] Timed out while draining session close callbacks; forcing IO contexts to stop."
+    if (deadline_reached) {
+        // 同一截止时间到达后先向全部 Session 投递强关，再等待任何可能仍在执行的用户回调退出。
+        for (auto& session : sessions_to_close) {
+            session->ForceActiveClose();
+        }
+    }
+
+    for (auto& session : sessions_to_close) {
+        if (!session->WaitForCloseCompletion()) {
+            std::cerr << "[TcpServer] Session send drain timed out or failed; connection was forced closed."
                       << std::endl;
         }
     }
@@ -160,10 +171,10 @@ void TcpServer::DoAccept() {
                     on_connect_(session);
                 } catch (const std::exception& e) {
                     std::cerr << "[TcpServer] on_connect exception: " << e.what() << std::endl;
-                    session->Close();
+                    session->RequestAsyncClose();
                 } catch (...) {
                     std::cerr << "[TcpServer] on_connect unknown exception" << std::endl;
-                    session->Close();
+                    session->RequestAsyncClose();
                 }
             }
 

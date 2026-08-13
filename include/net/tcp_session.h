@@ -12,6 +12,9 @@
 #include <string>
 #include <atomic>
 #include <array>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 
 namespace net {
 
@@ -50,9 +53,9 @@ using OnErrorHandler = std::function<void(TcpSessionPtr session, const std::erro
  * 1. 引用计数保证：继承自 std::enable_shared_from_this<TcpSession>。在发起任何底层 Asio 异步操作
  *    （async_read_some、async_write、async_wait）时，都会通过 shared_from_this() 生成一个副本捕获到
  *    Lambda 闭包中。只要底层内核还有未决的 I/O 操作，该 Session 对象就绝对不会被提前析构，彻底消除悬空指针。
- * 2. 线程模型与串行化：每个 Session 在创建时绑定到一个特定的 IO 线程（io_context）。虽然 Send() 和 Close()
- *    允许从任意外部业务线程调用，但底层真正的 socket 读写、发送队列操作与定时器重置全部通过 asio::post
- *    排队在绑定的 executor 中串行执行。
+ * 2. 线程模型与串行化：每个 Session 在创建时绑定到一个特定的 IO 线程（io_context）。Send() 可从任意
+ *    业务线程调用；同步 Close() 只能从 Session IO 线程以外调用。底层 socket 读写、发送队列操作与
+ *    定时器重置全部通过 asio::post 排队在绑定的 executor 中串行执行。
  *    注意：当前正确性依赖“One io_context 只有一个 run 线程”。若后续改为多线程 run 同一个 io_context，
  *    则必须引入 explicit asio::strand 来保证串行。
  * 3. 发送背压机制（Backpressure）：内置发送队列与原子高水位限制，防止客户端因“慢网络/只读不读”导致服务端内存无底线暴涨。
@@ -94,7 +97,7 @@ public:
      *   若业务强依赖顺序，上层需在业务层增加序号或在单一业务线程中投递。
      * - 内存语义：函数内部会立即深拷贝 data[0, length) 到缓冲区中，函数返回后调用方可立即释放原数据。
      * - 发送队列与背压：如果当前有未完成的写操作，数据将存入 write_queue_；如果当前排队总字节数超过
-     *   max_send_queue_size_，将拒绝发送并自动触发 Close() 切断连接防 OOM。
+     *   max_send_queue_size_，将拒绝发送并异步切断连接防 OOM。
      */
     void Send(const uint8_t* data, std::size_t length);
 
@@ -105,11 +108,14 @@ public:
     void Send(const std::string& message);
 
     /**
-     * @brief 幂等地请求异步关闭连接。
-     * @note 线程安全。函数返回时仅代表关闭任务已排入 IO 线程，不代表底层连接已立刻断开。
-     *       底层完全关闭后会触发 on_close 回调。
+     * @brief 同步排空并关闭连接，为上层业务对象销毁建立回调屏障。
+     * @param timeout 等待已接受发送完成的最长时间；超时后强制关闭并丢弃余量。
+     * @return true 表示已接受发送全部完成后关闭；false 表示超时或网络错误导致强制关闭。
+     * @note 线程安全，但严禁从本 Session 所属 IO 线程调用，否则抛出 std::logic_error。
+     *       返回前会等待当前用户回调退出，清空所有用户回调；返回后本 Session 不再触发用户回调。
+     *       timeout 仅限制发送排空，不能中断一个已经执行且尚未返回的用户回调。
      */
-    void Close();
+    bool Close(std::chrono::milliseconds timeout = std::chrono::milliseconds(3000));
 
     /**
      * @brief 获取底层 socket 对象的引用。
@@ -122,7 +128,7 @@ public:
      * @brief 检查当前是否已经发起了关闭请求。
      * @return true 表示已调用过 Close() 或连接已进入断开流程。
      */
-    bool IsClosed() const { return is_closed_.load(std::memory_order_acquire); }
+    bool IsClosed() const;
 
     /** @brief 获取对端客户端的 IP 地址字符串（如 "127.0.0.1"） */
     std::string GetRemoteAddress() const { return remote_address_; }
@@ -135,10 +141,10 @@ public:
     /** @brief 设置接收到应用层数据时的回调函数 */
     void SetOnMessage(OnMessageHandler cb) { on_message_ = std::move(cb); }
 
-    /** @brief 设置连接彻底关闭时的回调函数 */
+    /** @brief 设置连接彻底关闭时的回调函数；主动同步 Close 时会被抑制 */
     void SetOnClose(OnCloseHandler cb) { on_close_ = std::move(cb); }
 
-    /** @brief 设置发生网络 I/O 错误时的回调函数 */
+    /** @brief 设置发生网络 I/O 错误时的回调函数；主动同步 Close 时会被抑制 */
     void SetOnError(OnErrorHandler cb) { on_error_ = std::move(cb); }
 
     /** @brief 动态设置心跳空闲超时时间（秒）。<=0 表示不超时 */
@@ -158,11 +164,45 @@ private:
 
     using Executor = asio::ip::tcp::socket::executor_type;
 
-    /**
-     * @brief 内部带完成通知的关闭逻辑，供 TcpServer::Stop() 实现优雅排空与跨线程等待。
-     * @param completion 关闭任务在 IO 线程完成后的通知函数
-     */
-    void Close(std::function<void()> completion);
+    enum class State {
+        Open,
+        Draining,
+        Closing,
+        Closed
+    };
+
+    /** @brief 发起主动排空关闭但不等待，供公开 Close 与 TcpServer::Stop 使用 */
+    void BeginActiveClose();
+
+    /** @brief 等待关闭；排空超时后投递强制关闭，最终等待完整回调屏障 */
+    bool WaitForClose(std::chrono::milliseconds timeout);
+
+    /** @brief 仅限时等待 Closed，不触发强关（供 TcpServer 共享截止时间） */
+    bool WaitUntilClosed(std::chrono::milliseconds timeout);
+
+    /** @brief 投递一次主动强关；幂等 */
+    void ForceActiveClose();
+
+    /** @brief 无超时等待完整回调屏障，并返回统一排空结果 */
+    bool WaitForCloseCompletion();
+
+    /** @brief 框架内部异步关闭入口，不阻塞调用线程；正常保留 on_close 语义 */
+    void RequestAsyncClose();
+
+    /** @brief 在 Session executor 中开始主动排空 */
+    void BeginDrainOnExecutor();
+
+    /** @brief 在 Session executor 中检查主动排空是否完成 */
+    void MaybeFinishDrain();
+
+    /** @brief 在 Session executor 中强制关闭；false 表示排空失败 */
+    void ForceCloseOnExecutor(bool drained, bool notify_close);
+
+    /** @brief 强制关闭后，等待发送 handler/任务释放 buffer，再完成最终收尾 */
+    void MaybeFinalizeForcedClose();
+
+    /** @brief 执行最终业务回调清理、内部移除及同步等待者通知 */
+    void FinalizeCloseOnExecutor();
 
     /** @brief 发起底层异步读操作（async_read_some） */
     void DoRead();
@@ -185,20 +225,34 @@ private:
     /** @brief 返回构造时缓存的 executor，避免外部线程访问 socket 获取 executor */
     const Executor& GetExecutor() const { return executor_; }
 
+    /** @brief 判断当前线程是否正在运行本 Session 的 io_context */
+    bool RunningInThisIoThread() const;
+
 private:
     asio::ip::tcp::socket socket_;             ///< 底层 TCP socket 对象
     Executor executor_;                        ///< 构造时缓存，供任意线程安全地投递 Session 任务
+    asio::io_context* io_context_;              ///< executor 所属上下文，用于同步 Close 的死锁检测
     std::string remote_address_;               ///< 缓存的客户端 IP
-    unsigned short remote_port_;               ///< 缓存的客户端 Port
+    unsigned short remote_port_{0};            ///< 缓存的客户端 Port
     asio::steady_timer heartbeat_timer_;       ///< 心跳检测定时器
     int heartbeat_timeout_s_;                  ///< 心跳超时秒数
-    std::atomic<bool> is_closed_;              ///< 标志位：是否已进入关闭流程（供跨线程快速判断）
-    bool close_completed_;                     ///< 标志位：在 IO 线程内标记关闭回调是否已执行，防止重复触发
+    std::atomic<State> state_;                  ///< Open/Draining/Closing/Closed 生命周期状态
+    std::atomic<bool> active_close_requested_{false}; ///< 主动关闭时抑制全部业务回调
 
     std::array<uint8_t, 8192> read_buffer_;    ///< 读缓冲区（每个 Session 独立 8KB）
     std::deque<std::vector<uint8_t>> write_queue_; ///< 待发送的数据包队列（严格在 IO 线程内操作）
     std::size_t max_send_queue_size_{10 * 1024 * 1024}; ///< 最大允许排队的待发送字节数（默认 10MB）
     std::atomic<std::size_t> current_send_queue_size_{0}; ///< 当前发送队列中累积的字节数（原子计数）
+    std::atomic<std::size_t> pending_send_tasks_{0}; ///< 已接受但尚未在 IO 线程完成入队/回滚的任务数
+    bool write_in_progress_{false};             ///< 仅由 Session IO 线程访问
+    bool notify_close_on_finalize_{false};      ///< 内部断开是否需要触发业务 on_close
+
+    std::mutex admission_mutex_;                ///< 原子化 Send 接受与 Open->Draining/Closing 转换
+    std::mutex callback_mutex_;                 ///< 串行化业务回调与主动关闭线性化边界
+    std::mutex close_mutex_;                    ///< 保护同步关闭结果与条件变量
+    std::condition_variable close_cv_;
+    bool force_close_posted_{false};
+    bool drain_succeeded_{false};
 
     OnMessageHandler on_message_;              ///< 业务数据回调
     OnCloseHandler on_close_;                  ///< 业务关闭回调

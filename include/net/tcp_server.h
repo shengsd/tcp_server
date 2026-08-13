@@ -87,7 +87,7 @@ public:
      *
      * 【关闭时序与安全约束】：
      * 1. 外部线程约束：必须从外部控制线程（如 main 函数的主线程）调用；严禁在 IO 回调（如 on_message）中调用，否则抛出 std::logic_error 异常。
-     * 2. 会话优雅排空：首先停止接收新连接，随后向所有 active_sessions_ 发起异步 Close 并等待 3 秒宽限期。
+     * 2. 会话优雅排空：所有 active_sessions_ 并行进入 Draining，共享 3 秒截止时间，随后完成回调屏障。
      * 3. 线程安全 join：关闭 main_io_context 并依次 join acceptor 线程与 IO 工作线程池。
      */
     void Stop();
