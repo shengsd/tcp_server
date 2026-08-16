@@ -1,0 +1,8 @@
+{
+  "name": "tcp-server",
+  "version-string": "1.0.0",
+  "description": "High-performance cross-platform C++11 TCP server based on Standalone Asio and Apache log4cxx",
+  "dependencies": [
+    "log4cxx"
+  ]
+}

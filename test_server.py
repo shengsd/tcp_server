@@ -1,12 +1,27 @@
 import socket
 import time
 import subprocess
+import os
 import sys
 
+def find_server_executable():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base_dir, "build", "Release", "tcp_server_example.exe"),
+        os.path.join(base_dir, "build", "Debug", "tcp_server_example.exe"),
+        os.path.join(base_dir, "build", "tcp_server_example.exe"),
+        os.path.join(base_dir, "build", "tcp_server_example"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError("Could not find tcp_server_example executable in build/ directory")
+
 def run_tests():
-    print("[Test] Starting TCP Server process...")
-    server_proc = subprocess.Popen(["/Users/shengsd/github/tcp_server/build/tcp_server_example"])
-    time.sleep(1) # 等待服务器启动监听 8888 端口
+    exe_path = find_server_executable()
+    print(f"[Test] Starting TCP Server process ({exe_path})...")
+    server_proc = subprocess.Popen([exe_path], cwd=os.path.dirname(os.path.abspath(__file__)))
+    time.sleep(1.5) # 等待服务器启动监听 8888 端口
 
     try:
         # 测试 1：建立连接与 Echo 接收测试
@@ -24,6 +39,7 @@ def run_tests():
         echo_reply = s1.recv(1024).decode('utf-8')
         print(f"Echo response: {echo_reply.strip()}")
         assert "[Echo] Hello TCP Server" in echo_reply, "Echo response mismatch"
+        s1.close()
 
         # 测试 2：并发连接测试
         print("[Test 2] Testing multiple concurrent connections...")

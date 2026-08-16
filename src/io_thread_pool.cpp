@@ -1,5 +1,6 @@
 #include "net/io_thread_pool.h"
-#include <iostream>
+#include "net/logger.h"
+
 #include <stdexcept>
 
 namespace net {
@@ -29,11 +30,15 @@ void IOThreadPool::Start() {
     if (running_) return; // 防止重复启动
     running_ = true;
 
+    LOG_INFO("IOThreadPool starting with %zu worker thread(s)", pool_size_);
+
     for (std::size_t i = 0; i < pool_size_; ++i) {
         // 创建工作线程，每个线程绑定其独立的 io_context 实例
         threads_.emplace_back([this, i]() {
+            LOG_DEBUG("IO worker thread #%zu started", i);
             // 进入事件循环：阻塞等待并分发在该 io_context 注册的读/写/定时器事件
             io_contexts_[i]->run();
+            LOG_DEBUG("IO worker thread #%zu exited", i);
         });
     }
 }
@@ -48,6 +53,8 @@ void IOThreadPool::Stop() {
 
     if (!running_) return;
     running_ = false;
+
+    LOG_INFO("IOThreadPool stopping... waiting for %zu worker thread(s) to join", threads_.size());
 
     // 1. 释放工作守卫（reset work guards）：
     // 告诉 io_context 不再有“人工维持”的待办任务。一旦队列中现存的已注册任务（如 Close 回调）执行完毕，run() 就会自然返回。
@@ -68,6 +75,8 @@ void IOThreadPool::Stop() {
         }
     }
     threads_.clear();
+
+    LOG_INFO("IOThreadPool stopped successfully");
 }
 
 // 检查当前调用线程的 ID 是否在工作线程列表中

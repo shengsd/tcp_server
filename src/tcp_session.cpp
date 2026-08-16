@@ -1,5 +1,5 @@
 #include "net/tcp_session.h"
-#include <iostream>
+#include "net/logger.h"
 
 namespace net {
 
@@ -18,6 +18,7 @@ TcpSession::TcpSession(asio::ip::tcp::socket socket, int heartbeat_timeout_s)
         remote_address_ = ep.address().to_string();
         remote_port_ = ep.port();
     }
+    LOG_DEBUG("TcpSession [%s:%u] created", remote_address_.c_str(), remote_port_);
 }
 
 // 析构函数：释放底层系统资源
@@ -29,10 +30,12 @@ TcpSession::~TcpSession() {
         socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
         socket_.close(ec);
     }
+    LOG_DEBUG("TcpSession [%s:%u] destroyed", remote_address_.c_str(), remote_port_);
 }
 
 // 启动会话：开启心跳检测并挂起第一次异步读
 void TcpSession::Start() {
+    LOG_DEBUG("TcpSession [%s:%u] starting I/O loop and heartbeat timer", remote_address_.c_str(), remote_port_);
     ResetHeartbeatTimer();
     DoRead();
 }
@@ -53,7 +56,8 @@ void TcpSession::Send(const uint8_t* data, std::size_t length) {
         // 超过高水位阈值（如 10MB）：说明客户端处理过慢/恶意不读取，产生积压。
         // 回滚计数并主动切断连接，保全服务端内存不被耗尽
         current_send_queue_size_.fetch_sub(length, std::memory_order_relaxed);
-        std::cerr << "[TcpSession] Send queue high watermark exceeded, closing connection." << std::endl;
+        LOG_WARN("TcpSession [%s:%u] Send queue high watermark exceeded (%zu + %zu > %zu bytes), closing connection.",
+                 remote_address_.c_str(), remote_port_, old_size, length, max_send_queue_size_);
         Close();
         return;
     }
@@ -79,6 +83,10 @@ void TcpSession::Send(const uint8_t* data, std::size_t length) {
             // 如果 write_queue_ 非空，说明已有底层 async_write 在飞，底层写完后会自动触发链式写入，这里仅入队即可。
             bool write_in_progress = !session->write_queue_.empty();
             session->write_queue_.push_back(std::move(buffer));
+
+            LOG_TRACE("TcpSession [%s:%u] Queued data chunk (%zu bytes, write_in_progress=%d)",
+                      session->remote_address_.c_str(), session->remote_port_,
+                      session->write_queue_.back().size(), write_in_progress ? 1 : 0);
 
             if (!write_in_progress) {
                 session->DoWrite();
@@ -110,6 +118,9 @@ void TcpSession::Close(std::function<void()> completion) {
         // 使用 close_completed_ 标志位保证关闭逻辑在 IO 线程内【严格只执行一次】
         if (!close_completed_) {
             close_completed_ = true;
+
+            LOG_DEBUG("TcpSession [%s:%u] Closing socket and canceling timers",
+                      remote_address_.c_str(), remote_port_);
 
             std::error_code ec;
             // 取消心跳定时器（会立即触发 timer 的 async_wait 回调，错误码为 operation_aborted）
@@ -149,6 +160,9 @@ void TcpSession::DoRead() {
             if (is_closed_) return;
 
             if (!ec) {
+                LOG_TRACE("TcpSession [%s:%u] Received %zu bytes",
+                          remote_address_.c_str(), remote_port_, bytes_transferred);
+
                 // 收到新数据，重置心跳超时计时器
                 ResetHeartbeatTimer();
 
@@ -179,10 +193,14 @@ void TcpSession::DoWrite() {
             }
 
             if (!ec) {
+                std::size_t written = write_queue_.front().size();
                 // 发送成功：从原子计数器中扣减已发送字节数
-                current_send_queue_size_.fetch_sub(write_queue_.front().size(), std::memory_order_relaxed);
+                current_send_queue_size_.fetch_sub(written, std::memory_order_relaxed);
                 // 弹出已发送完成的数据包
                 write_queue_.pop_front();
+
+                LOG_TRACE("TcpSession [%s:%u] Successfully sent %zu bytes, remaining queue items: %zu",
+                          remote_address_.c_str(), remote_port_, written, write_queue_.size());
 
                 // 如果队列中还有后续排队的数据包，继续触发下一次 async_write
                 if (!write_queue_.empty()) {
@@ -220,7 +238,8 @@ void TcpSession::ResetHeartbeatTimer() {
     heartbeat_timer_.async_wait([this, self](const std::error_code& ec) {
         if (!ec) {
             // 定时器正常触发（未被中途 cancel 且未发生错误），说明超时时间内没有收到任何数据包
-            std::cerr << "[TcpSession] Heartbeat timeout from " << remote_address_ << ":" << remote_port_ << ", closing." << std::endl;
+            LOG_WARN("TcpSession [%s:%u] Heartbeat timeout (%ds idle), closing connection.",
+                     remote_address_.c_str(), remote_port_, heartbeat_timeout_s_);
             Close();
         }
         // 如果 ec == asio::error::operation_aborted 说明被 ResetHeartbeatTimer() 重新刷新或连接已关闭，属正常现象
@@ -232,6 +251,14 @@ void TcpSession::HandleError(const std::error_code& ec) {
     // operation_aborted 是主动 cancel 引起的操作取消，不需要触发用户错误回调
     if (ec == asio::error::operation_aborted) {
         return;
+    }
+
+    if (ec == asio::error::eof || ec == asio::error::connection_reset) {
+        LOG_INFO("TcpSession [%s:%u] Peer disconnected: %s",
+                 remote_address_.c_str(), remote_port_, ec.message().c_str());
+    } else {
+        LOG_WARN("TcpSession [%s:%u] Network error: %s (code: %d)",
+                 remote_address_.c_str(), remote_port_, ec.message().c_str(), ec.value());
     }
 
     // 触发用户的错误回调

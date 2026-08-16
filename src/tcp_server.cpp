@@ -1,5 +1,6 @@
 #include "net/tcp_server.h"
-#include <iostream>
+#include "net/logger.h"
+
 #include <stdexcept>
 #include <future>
 #include <atomic>
@@ -19,6 +20,9 @@ TcpServer::TcpServer(unsigned short port, std::size_t thread_pool_size, int hear
     acceptor_.set_option(asio::ip::tcp::acceptor::reuse_address(true));
     acceptor_.bind(endpoint);
     acceptor_.listen();
+
+    LOG_INFO("TcpServer initialized on 0.0.0.0:%u (IO thread pool size: %zu, heartbeat timeout: %ds)",
+             port, thread_pool_size, heartbeat_timeout_s);
 }
 
 // 构造函数：基于指定 IP 地址和端口监听
@@ -32,6 +36,9 @@ TcpServer::TcpServer(const std::string& address, unsigned short port, std::size_
     acceptor_.set_option(asio::ip::tcp::acceptor::reuse_address(true));
     acceptor_.bind(endpoint);
     acceptor_.listen();
+
+    LOG_INFO("TcpServer initialized on %s:%u (IO thread pool size: %zu, heartbeat timeout: %ds)",
+             address.c_str(), port, thread_pool_size, heartbeat_timeout_s);
 }
 
 // 析构函数：确保对象销毁时自动执行 Stop()
@@ -43,6 +50,8 @@ TcpServer::~TcpServer() {
 void TcpServer::Start() {
     if (is_running_) return; // 避免重复启动
     is_running_ = true;
+
+    LOG_INFO("TcpServer starting... launching IO thread pool and acceptor event loop");
 
     // 1. 启动从 Reactor 线程池（各 IO 线程进入 run() 循环）
     io_thread_pool_.Start();
@@ -69,6 +78,8 @@ void TcpServer::Stop() {
     if (!is_running_) return;
     is_running_ = false;
 
+    LOG_INFO("TcpServer stopping... draining active sessions");
+
     // 1. 复制当前所有活跃会话快照（加锁保护）
     std::vector<TcpSessionPtr> sessions_to_close;
     {
@@ -79,6 +90,7 @@ void TcpServer::Stop() {
 
     // 2. 优雅排空机制：向所有会话投递异步 Close，并设置 3 秒宽限期等待未竟数据收尾
     if (!sessions_to_close.empty()) {
+        LOG_INFO("TcpServer draining %zu active session(s)...", sessions_to_close.size());
         auto count = std::make_shared<std::atomic<size_t>>(sessions_to_close.size());
         auto promise = std::make_shared<std::promise<void>>();
         auto future = promise->get_future();
@@ -94,8 +106,7 @@ void TcpServer::Stop() {
 
         // 等待所有连接优雅关闭，最多等待 3 秒宽限期
         if (future.wait_for(std::chrono::seconds(3)) == std::future_status::timeout) {
-            std::cerr << "[TcpServer] Timed out while draining session close callbacks; forcing IO contexts to stop."
-                      << std::endl;
+            LOG_WARN("TcpServer timed out while draining session close callbacks; forcing IO contexts to stop.");
         }
     }
 
@@ -111,6 +122,8 @@ void TcpServer::Stop() {
     if (acceptor_thread_.joinable()) {
         acceptor_thread_.join();
     }
+
+    LOG_INFO("TcpServer stopped gracefully");
 }
 
 // 异步接收新连接状态机
@@ -150,6 +163,9 @@ void TcpServer::DoAccept() {
                 active_sessions_.insert(session);
             }
 
+            LOG_INFO("Accepted new connection from %s:%u (active sessions: %zu)",
+                     session->GetRemoteAddress().c_str(), session->GetRemotePort(), active_sessions_.size());
+
             // 触发用户的连接建立通知回调
             if (on_connect_) {
                 on_connect_(session);
@@ -163,7 +179,7 @@ void TcpServer::DoAccept() {
                 }
             });
         } else if (ec != asio::error::operation_aborted) {
-            std::cerr << "[TcpServer] Accept error: " << ec.message() << std::endl;
+            LOG_ERROR("TcpServer accept error: %s (code: %d)", ec.message().c_str(), ec.value());
         }
 
         // 递归（挂起）下一次异步 Accept 监听

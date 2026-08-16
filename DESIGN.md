@@ -198,13 +198,45 @@ sequenceDiagram
 
 ---
 
-## 5. 快速上手示例
+---
+
+## 5. 日志系统设计 (Apache log4cxx)
+
+为了在保证高吞吐网络 I/O 的同时提供清晰、可追溯的系统运行状态，本项目集成了 **Apache log4cxx** 工业级日志框架，并进行了轻量级 C++11 封装：
+
+### 5.1 设计亮点
+1. **printf 风格变参宏**：提供 `LOG_TRACE`、`LOG_DEBUG`、`LOG_INFO`、`LOG_WARN`、`LOG_ERROR`、`LOG_FATAL`，支持任意类型变参格式化。
+2. **源码级定位追踪**：基于 `LOG4CXX_LOCATION` 宏，日志自动捕获并输出触发所在源文件、代码行号及函数名称。
+3. **零开销级别检测**：日志宏内置 `is*Enabled()` 前置判断，未开启的低级别日志（如生产环境的 TRACE）直接在判断处短路，跳过格式化字符串构造与堆栈展开。
+4. **灵活配置与平滑降级**：通过 `net::Logger::Init("log4cxx.properties")` 加载配置；若未配置或配置文件缺失，自动降级至 `BasicConfigurator` 控制台输出，绝不丢日志或引发崩溃。
+5. **滚动文件输出**：提供 `log4cxx.properties` 模板，支持最大文件大小切分（如 10MB）与历史备份归档。
+
+### 5.2 统一根 Logger 结构
+```mermaid
+graph LR
+    subgraph NetCore["网络框架核心"]
+        Server[TcpServer] -->|LOG_INFO / LOG_WARN| Logger[net::Logger]
+        Session[TcpSession] -->|LOG_DEBUG / LOG_TRACE| Logger
+        Pool[IOThreadPool] -->|LOG_DEBUG| Logger
+    end
+
+    Logger --> RootLogger["log4cxx::Logger (TcpServer)"]
+    RootLogger --> Console["ConsoleAppender (控制台带色彩)"]
+    RootLogger --> File["RollingFileAppender (logs/tcp_server.log)"]
+```
+
+---
+
+## 6. 快速上手示例
 
 ```cpp
 #include "net/tcp_server.h"
-#include <iostream>
+#include "net/logger.h"
 
 int main() {
+    // 0. 初始化日志系统
+    net::Logger::Init("log4cxx.properties");
+
     unsigned short port = 8888;
     int heartbeat_timeout = 30; // 30秒无数据自动断开空闲连接
 
@@ -219,10 +251,10 @@ int main() {
 
     // 2. 客户端连接/断开事件监听
     server.SetOnConnect([](net::TcpSessionPtr s) {
-        std::cout << "Client connected: " << s->GetRemoteAddress() << ":" << s->GetRemotePort() << std::endl;
+        LOG_INFO("Client connected from %s:%u", s->GetRemoteAddress().c_str(), s->GetRemotePort());
     });
     server.SetOnClose([](net::TcpSessionPtr s) {
-        std::cout << "Client closed: " << s->GetRemoteAddress() << std::endl;
+        LOG_INFO("Client closed from %s:%u", s->GetRemoteAddress().c_str(), s->GetRemotePort());
     });
 
     // 3. 启动服务端（非阻塞调用）
@@ -236,8 +268,30 @@ int main() {
 
 ---
 
-## 6. 后续演进建议
+---
+
+## 7. 跨平台与 Windows 适配架构
+
+本项目原生支持 **Linux / Windows / macOS** 跨平台编译与部署，在网络层与编译期进行了细致的兼容性处理：
+
+### 7.1 Windows 网络层与 Winsock 适配
+- **底层驱动库**：Windows 平台自动链接 `ws2_32.lib` 与 `mswsock.lib`，由 Asio 自动接管 Windows Sockets 2 初始化与异步 I/O 完成端口（IOCP）或 select 机制。
+- **预编译宏隔离**：
+  - `_WIN32_WINNT=0x0601`：明确设定目标 API 为 Windows 7 及以上系统，开启完整的 Winsock2 与线程支持。
+  - `WIN32_LEAN_AND_MEAN`：剔除 Windows 极少使用的头文件（如 RPC、Crypto、DDE 等），避免命名污染并大幅提升编译速度。
+  - `_CRT_SECURE_NO_WARNINGS`：消除 MSVC 对传统 CRT 函数（如 `vsnprintf`）的无谓告警。
+- **MSVC 字符集兼容**：开启 `/utf-8` 编译参数，确保包含中文字符的日志输出及源文件在 Windows 终端与 IDE 中均不出现乱码。
+
+### 7.2 包管理与依赖自动发现
+- 在 Windows 下，CMakeLists.txt 自动探测并注入 `vcpkg` 工具链路径（支持 `$ENV{VCPKG_ROOT}`、`%USERPROFILE%/vcpkg`、`C:/vcpkg`），支持 `log4cxx` 动静态库（`log4cxx.lib` / `log4cxxs.lib`）的自动定位与链接。
+
+---
+
+## 8. 后续演进建议
 
 1. **应用层协议编解码（Codec）**：建议在 `OnMessageHandler` 上层封装基于固定长度包头（如 4 字节 Payload Length）的 `LengthFieldCodec`，以便处理 TCP 流式通信中的粘包和拆包问题。
 2. **高频小包内存池优化**：若面对数百万 QPS 的极端小包场景，可引入环形缓冲区（RingBuffer）或 Slice 内存池减少 `std::vector` 的内存分配开销。
 3. **超大规模连接心跳优化**：当连接规模达到 10 万+ 时，可引入**时间轮算法（Timing Wheel）**替代单 Session 独立定时器以降低调度开销。
+4. **日志异步刷盘（AsyncAppender）**：极高并发写日志场景下，可在 `log4cxx.properties` 中配置 `org.apache.log4j.AsyncAppender`，将文件 I/O 完全剥离至后台写线程。
+
+

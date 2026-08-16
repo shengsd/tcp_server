@@ -8,3 +8,5 @@ build/
 .idea/
 .cache/
 compile_commands.json
+logs/
+*.log
